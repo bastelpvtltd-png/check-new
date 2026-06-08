@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: paper-trading-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: STATE_FILE
+        value: /tmp/bot_state.json
