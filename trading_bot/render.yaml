@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: paper-trading-bot
+    name: futures-trading-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
@@ -9,3 +9,11 @@ services:
         value: 3.11.9
       - key: STATE_FILE
         value: /tmp/bot_state.json
+      - key: BINANCE_FUTURES_API_KEY
+        value: YOUR_KEY_HERE
+      - key: BINANCE_FUTURES_SECRET
+        value: YOUR_SECRET_HERE
+      - key: TELEGRAM_BOT_TOKEN
+        value: YOUR_TG_TOKEN
+      - key: TELEGRAM_CHAT_ID
+        value: YOUR_CHAT_ID
