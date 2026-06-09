@@ -352,6 +352,8 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         score += htf_strength; reasons.append(f"HTF BULL +{htf_strength}")
     elif direction == "SHORT" and htf_trend == "BEAR":
         score += htf_strength; reasons.append(f"HTF BEAR +{htf_strength}")
+    elif htf_trend == "NEUTRAL":
+        score += 1; reasons.append("HTF neutral")
     else:
         return 0, ["HTF counter-trend"]
 
@@ -362,9 +364,12 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
     else:           score += 1; reasons.append(f"ADX {adx:.1f}")
 
     st = int(c.get('ST_DIR', 0) or 0)
-    if direction == "LONG"  and st != 1:  return 0, ["ST bearish"]
-    if direction == "SHORT" and st != -1: return 0, ["ST bullish"]
-    score += 1; reasons.append("ST ✓")
+    if direction == "LONG":
+        if st == 1:  score += 2; reasons.append("ST bull ✓")
+        else:        score -= 1; reasons.append("ST bear ⚠")
+    else:
+        if st == -1: score += 2; reasons.append("ST bear ✓")
+        else:        score -= 1; reasons.append("ST bull ⚠")
 
     cl = float(c['close']); prev_cl = float(prev['close'])
     e8  = float(c['EMA8']); e21 = float(c['EMA21'])
