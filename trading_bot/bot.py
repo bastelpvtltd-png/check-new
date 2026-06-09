@@ -457,10 +457,20 @@ def monitor_open_trades():
             continue
 
         direction = trade["direction"]
-        sl  = trade["sl"]
-        tp1 = trade["tp1"]
-        tp2 = trade["tp2"]
         entry = trade["entry"]
+        sl    = trade["sl"]
+        tp1   = trade["tp1"]
+        tp2   = trade["tp2"]
+
+        # Live P&L log every monitor cycle
+        if direction == "LONG":
+            live_pnl_pct = (price - entry) / entry * 100
+        else:
+            live_pnl_pct = (entry - price) / entry * 100
+        tp1_hit = trade.get("tp1_hit", False)
+        log.info(f"MONITOR {sym} {direction} | price={price:.4f} entry={entry:.4f} pnl={live_pnl_pct:+.2f}% | sl={sl:.4f} tp1={tp1:.4f} tp1_hit={tp1_hit}")
+
+
 
         outcome = None
         pnl_pct = 0.0
@@ -586,44 +596,57 @@ def scan_once():
 
     active_coins = [c for c in WATCH_LIST if c not in BLOCKED_COINS]
     found = 0
+    scan_summary = []
 
     for coin in active_coins:
         if len(state["open_trades"]) >= MAX_OPEN_TRADES: break
         if state.get("signals_today", 0) >= MAX_SIGNALS_DAY: break
 
         existing = [t for t in state["open_trades"] if t["symbol"] == coin]
-        if len(existing) >= 2: continue
+        if len(existing) >= 2:
+            scan_summary.append(f"{coin}:already_open")
+            continue
 
         htf_trend, htf_strength = get_htf_trend(coin)
-        if htf_trend == "NEUTRAL": continue
 
         df_raw = get_klines(coin, "1h", DATA_LIMIT)
         if df_raw is None:
             add_log(state, f"⚠️ {coin} — klines failed, skipping", "WARN")
+            scan_summary.append(f"{coin}:klines_fail")
             continue
 
         df = compute_indicators(df_raw)
         i  = len(df) - 1
-        if i < 100: continue
+        if i < 100:
+            scan_summary.append(f"{coin}:insufficient_data")
+            continue
 
         c = df.iloc[i]
         if any(pd.isna(c.get(k, float('nan'))) for k in ['ATR','EMA200','STOCHRSI','ADX']):
+            scan_summary.append(f"{coin}:indicator_nan")
             continue
 
         if htf_trend == "BULL":
             directions = ["LONG"]
         elif htf_trend == "BEAR":
             directions = ["SHORT"]
-        else:  # NEUTRAL — follow ST direction to pick one side only
-            st_dir_now = int(df.iloc[-1].get('ST_DIR', 1) if hasattr(df.iloc[-1], 'get') else 1)
+        else:  # NEUTRAL — follow ST direction
+            st_dir_now = int(c.get('ST_DIR', 1) or 1)
             directions = ["LONG"] if st_dir_now == 1 else ["SHORT"]
+
+        coin_signal_found = False
         for direction in directions:
             score, reasons = score_signal(df, i, direction, htf_trend, htf_strength)
-            if score < MIN_SCORE: continue
+            if score < MIN_SCORE:
+                if not coin_signal_found:
+                    scan_summary.append(f"{coin}:{direction}_score{score}")
+                continue
 
             entry = float(c['close'])
             sl, tp1, tp2, sl_pct, tp1_pct, rr = calculate_levels(df, i, direction, entry)
-            if rr < MIN_RR: continue
+            if rr < MIN_RR:
+                scan_summary.append(f"{coin}:{direction}_score{score}_rr{rr:.1f}_FAIL")
+                continue
 
             with _lock:
                 state = load_state()
@@ -683,13 +706,28 @@ def scan_once():
                f"_{' | '.join(reasons[:4])}_\n"
                f"{'✅ Testnet order placed' if order_ok else '📝 Signal tracked (paper)'}")
 
+            coin_signal_found = True
+            scan_summary.append(f"{coin}:{direction}_score{score}_TRADE")
             found += 1
             time.sleep(0.5)
+
+        if not coin_signal_found and not any(coin in s for s in scan_summary):
+            scan_summary.append(f"{coin}:{htf_trend}_no_signal")
 
     with _lock:
         state = load_state()
         state["bot_status"] = "idle"
+        # Log full scan summary
         add_log(state, f"✅ Scan done — {found} new signals | Open: {len(state['open_trades'])}")
+        # Log per-coin breakdown in chunks
+        chunk = []
+        for item in scan_summary:
+            chunk.append(item)
+            if len(chunk) == 5:
+                add_log(state, "📋 " + " | ".join(chunk))
+                chunk = []
+        if chunk:
+            add_log(state, "📋 " + " | ".join(chunk))
         save_state(state)
 
 # ══════════════════════════════════════════════════════════════════
