@@ -12,10 +12,10 @@ log = logging.getLogger("BOT")
 # ═══════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════
-API_KEY    = os.environ.get("MQCRE73wSXRWvVelCsAtkyfb5mdqkxRlwEVBB48bCDDTtapRxrzz7h6H7qbbNjzF", "")
-API_SECRET = os.environ.get("g31rh1FdKWkmPTb2yImH674OlY95MZwl2L9VDyFdpOta69SXrjQdz9MTgciVarJ4",  "")
-TELEGRAM_TOKEN = os.environ.get("8910127779:AAEclcMbXH7TcdByg-v44ckifaX9wKjGoCU", "")
-TELEGRAM_CHAT  = os.environ.get("1450144996",   "")
+API_KEY    = os.environ.get("BINANCE_FUTURES_API_KEY", "")
+API_SECRET = os.environ.get("BINANCE_FUTURES_SECRET",  "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
 FUTURES_BASE   = "https://testnet.binancefuture.com"   # Futures testnet
 STATE_FILE     = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
@@ -27,7 +27,7 @@ WATCH_LIST = [
     "OPUSDT","ARBUSDT","SUIUSDT","TIAUSDT","FETUSDT"
 ]
 
-MIN_SCORE        = 7
+MIN_SCORE        = 4
 MAX_SIGNALS_DAY  = 15
 MAX_OPEN_TRADES  = 15
 MIN_RR           = 1.8

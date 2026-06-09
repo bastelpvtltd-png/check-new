@@ -10,10 +10,10 @@ services:
       - key: STATE_FILE
         value: /tmp/bot_state.json
       - key: BINANCE_FUTURES_API_KEY
-        value: YOUR_KEY_HERE
+        value: MQCRE73wSXRWvVelCsAtkyfb5mdqkxRlwEVBB48bCDDTtapRxrzz7h6H7qbbNjzF
       - key: BINANCE_FUTURES_SECRET
-        value: YOUR_SECRET_HERE
+        value: g31rh1FdKWkmPTb2yImH674OlY95MZwl2L9VDyFdpOta69SXrjQdz9MTgciVarJ4
       - key: TELEGRAM_BOT_TOKEN
-        value: YOUR_TG_TOKEN
+        value: 8910127779:AAEclcMbXH7TcdByg-v44ckifaX9wKjGoCU
       - key: TELEGRAM_CHAT_ID
-        value: YOUR_CHAT_ID
+        value: 1450144996
