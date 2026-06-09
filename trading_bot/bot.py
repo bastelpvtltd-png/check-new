@@ -610,7 +610,13 @@ def scan_once():
         if any(pd.isna(c.get(k, float('nan'))) for k in ['ATR','EMA200','STOCHRSI','ADX']):
             continue
 
-        directions = ["LONG"] if htf_trend == "BULL" else ["SHORT"]
+        if htf_trend == "BULL":
+            directions = ["LONG"]
+        elif htf_trend == "BEAR":
+            directions = ["SHORT"]
+        else:  # NEUTRAL — follow ST direction to pick one side only
+            st_dir_now = int(df.iloc[-1].get('ST_DIR', 1) if hasattr(df.iloc[-1], 'get') else 1)
+            directions = ["LONG"] if st_dir_now == 1 else ["SHORT"]
         for direction in directions:
             score, reasons = score_signal(df, i, direction, htf_trend, htf_strength)
             if score < MIN_SCORE: continue
