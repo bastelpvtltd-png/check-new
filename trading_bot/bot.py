@@ -35,10 +35,6 @@ COOLDOWN_BARS   = 4
 MIN_RR          = 1.8
 MAX_OPEN_TRADES = 8
 DATA_LIMIT      = 300
-LK_OFFSET_SEC   = 5*3600 + 30*60
-SKIP_UTC_START  = 0
-SKIP_UTC_END    = 6
-
 SCORE_ALLOC = {6: 4.0, 7: 6.0, 8: 9.0, 9: 14.0, 10: 18.0}
 MAX_ALLOC_PCT    = 0.20
 MIN_TRADE_USDT   = 5.0
@@ -343,10 +339,6 @@ def get_htf_trend(symbol):
 def score_signal(df, i, direction, htf_trend, htf_strength):
     c = df.iloc[i]; prev = df.iloc[i-1]
     score = 0; reasons = []
-
-    utc_h = (int(df.iloc[i]['Open_time']) // 1000 // 3600) % 24
-    if SKIP_UTC_START <= utc_h < SKIP_UTC_END:
-        return 0, ["Dead session"]
 
     if direction == "LONG" and htf_trend == "BULL":
         score += htf_strength; reasons.append(f"HTF BULL +{htf_strength}")
