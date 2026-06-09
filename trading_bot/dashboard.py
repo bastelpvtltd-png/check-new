@@ -3,7 +3,7 @@ from flask import Flask, jsonify, render_template_string
 from datetime import datetime
 
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
-STARTING_BALANCE = 100_000.0
+STARTING_BALANCE = 100.0
 
 app = Flask(__name__)
 

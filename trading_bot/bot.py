@@ -38,7 +38,7 @@ DATA_LIMIT      = 300
 SCORE_ALLOC = {6: 4.0, 7: 6.0, 8: 9.0, 9: 14.0, 10: 18.0}
 MAX_ALLOC_PCT    = 0.20
 MIN_TRADE_USDT   = 5.0
-STARTING_BALANCE = 100_000.0
+STARTING_BALANCE = 100.0
 
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
 
