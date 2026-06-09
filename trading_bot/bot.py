@@ -13,12 +13,14 @@ log = logging.getLogger("BOT")
 # CONFIG — .env or environment variables
 # ══════════════════════════════════════════════════════════════════
 API_KEY    = os.environ.get("BINANCE_TESTNET_API_KEY", "")
-API_SECRET = os.environ.get("BINANCE_TESTNET_SECRET", "")
+API_SECRET = os.environ.get("BINANCE_TESTNET_SECRET",  "")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
-TESTNET_BASE = "https://testnet.binancefuture.com"  # Correct Futures testnet URL
+# Public data endpoints — no auth needed, Render-accessible
+PUBLIC_BASE  = "https://api.binance.us"          # real market data (public)
+TESTNET_BASE = "https://testnet.binance.vision"   # Spot testnet for orders
 
 WATCH_LIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
@@ -26,20 +28,20 @@ WATCH_LIST = [
     "LTCUSDT","UNIUSDT","NEARUSDT","APTUSDT","INJUSDT",
     "OPUSDT","ARBUSDT","SUIUSDT","TIAUSDT","FETUSDT"
 ]
-BLOCKED_COINS   = []  # no coins blocked
+BLOCKED_COINS   = []
 MIN_SCORE       = 3
 MAX_SIGNALS_DAY = 15
 COOLDOWN_BARS   = 4
-MIN_RR          = 1.5   # Reduced to get more signals
+MIN_RR          = 1.8
 MAX_OPEN_TRADES = 8
 DATA_LIMIT      = 300
+LK_OFFSET_SEC   = 5*3600 + 30*60
 SKIP_UTC_START  = 0
-SKIP_UTC_END    = 0      # Changed to 0 to allow trading anytime
+SKIP_UTC_END    = 6
 
-# Score → % of available balance
 SCORE_ALLOC = {6: 4.0, 7: 6.0, 8: 9.0, 9: 14.0, 10: 18.0}
-MAX_ALLOC_PCT   = 0.20
-MIN_TRADE_USDT  = 5.0
+MAX_ALLOC_PCT    = 0.20
+MIN_TRADE_USDT   = 5.0
 STARTING_BALANCE = 100_000.0
 
 STATE_FILE = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
@@ -59,19 +61,14 @@ def make_session():
 SESSION = make_session()
 
 # ══════════════════════════════════════════════════════════════════
-# STATE MANAGER (thread-safe, persisted to JSON)
+# STATE MANAGER
 # ══════════════════════════════════════════════════════════════════
 _lock = threading.Lock()
-_last_error = None  # Store last error for dashboard
 
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-            # Ensure all fields exist
-            if "error" not in state:
-                state["error"] = None
-            return state
+            return json.load(f)
     except:
         return {
             "balance": STARTING_BALANCE,
@@ -84,8 +81,7 @@ def load_state():
             "last_scan": "",
             "wins": 0, "losses": 0, "bes": 0,
             "total_pnl": 0.0,
-            "log": [],
-            "error": None
+            "log": []
         }
 
 def save_state(state):
@@ -98,16 +94,6 @@ def add_log(state, msg, level="INFO"):
     state["log"].insert(0, entry)
     state["log"] = state["log"][:200]
     log.info(msg)
-
-def set_error(state, error_msg):
-    """Set error message to be shown on dashboard"""
-    state["error"] = error_msg
-    add_log(state, f"ERROR: {error_msg}", "ERROR")
-    save_state(state)
-
-def clear_error(state):
-    state["error"] = None
-    save_state(state)
 
 # ══════════════════════════════════════════════════════════════════
 # TELEGRAM
@@ -123,7 +109,71 @@ def tg(msg):
         time.sleep(0.2)
 
 # ══════════════════════════════════════════════════════════════════
-# BINANCE TESTNET API
+# BINANCE API — PUBLIC DATA (api.binance.us, no auth)
+# ══════════════════════════════════════════════════════════════════
+def get_klines(symbol, interval="1h", limit=300):
+    """Fetch OHLCV from public Binance.US endpoint — no auth needed."""
+    try:
+        r = SESSION.get(
+            f"{PUBLIC_BASE}/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=12
+        )
+        if r.status_code != 200:
+            log.warning(f"klines {symbol} HTTP {r.status_code}: {r.text[:120]}")
+            return None
+        rows = r.json()
+        if not rows or isinstance(rows, dict):
+            log.warning(f"klines {symbol} bad response: {str(rows)[:120]}")
+            return None
+        df = pd.DataFrame(rows, columns=[
+            'Open_time','open','high','low','close','volume',
+            'Close_time','qav','num_trades','taker_base','taker_quote','ignore'])
+        for c in ['open','high','low','close','volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df['Open_time'] = df['Open_time'].astype(int)
+        df = df.dropna(subset=['open','high','low','close'])
+        return df.reset_index(drop=True) if len(df) >= 50 else None
+    except Exception as e:
+        log.error(f"get_klines {symbol} error: {e}")
+        return None
+
+def get_price(symbol):
+    """Get current price from public Binance.US endpoint."""
+    try:
+        r = SESSION.get(
+            f"{PUBLIC_BASE}/api/v3/ticker/price",
+            params={"symbol": symbol},
+            timeout=6
+        )
+        if r.status_code == 200:
+            return float(r.json()["price"])
+    except Exception as e:
+        log.error(f"get_price {symbol} error: {e}")
+    return None
+
+def get_htf_klines(symbol, interval, limit):
+    """Fetch higher timeframe klines from public endpoint."""
+    try:
+        r = SESSION.get(
+            f"{PUBLIC_BASE}/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10
+        )
+        if r.status_code != 200 or not r.json() or isinstance(r.json(), dict):
+            return None
+        rows = r.json()
+        df = pd.DataFrame(rows, columns=[
+            'Open_time','open','high','low','close','volume',
+            'Close_time','qav','num_trades','taker_base','taker_quote','ignore'])
+        df['close'] = pd.to_numeric(df['close'])
+        return df
+    except Exception as e:
+        log.error(f"htf_klines {symbol} {interval} error: {e}")
+        return None
+
+# ══════════════════════════════════════════════════════════════════
+# BINANCE TESTNET — SIGNED ORDERS (testnet.binance.vision)
 # ══════════════════════════════════════════════════════════════════
 import hmac, hashlib
 from urllib.parse import urlencode
@@ -132,7 +182,7 @@ def sign(params: dict) -> str:
     query = urlencode(params)
     return hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-def binance_get(path, params=None, signed=False):
+def testnet_get(path, params=None, signed=False):
     if params is None: params = {}
     if signed:
         params["timestamp"] = int(time.time() * 1000)
@@ -143,10 +193,10 @@ def binance_get(path, params=None, signed=False):
                         headers=headers, timeout=12)
         return r.json()
     except Exception as e:
-        log.error(f"GET {path} error: {e}")
+        log.error(f"testnet GET {path} error: {e}")
         return None
 
-def binance_post(path, params):
+def testnet_post(path, params):
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign(params)
     headers = {"X-MBX-APIKEY": API_KEY}
@@ -155,108 +205,56 @@ def binance_post(path, params):
                          headers=headers, timeout=12)
         return r.json()
     except Exception as e:
-        log.error(f"POST {path} error: {e}")
-        return None
-
-def get_klines(symbol, interval="1h", limit=300):
-    """Get klines from Binance Futures (public endpoint, no API key needed)"""
-    try:
-        # Using real Binance futures API for data (public)
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        
-        data = SESSION.get(url, params=params, timeout=12)
-        
-        if data.status_code != 200:
-            log.error(f"Klines error {symbol}: {data.status_code}")
-            return None
-        
-        rows = data.json()
-        if not rows or not isinstance(rows, list) or len(rows) < 50:
-            return None
-            
-        df = pd.DataFrame(rows, columns=[
-            'Open_time','open','high','low','close','volume',
-            'Close_time','qav','num_trades','taker_base','taker_quote','ignore'])
-        
-        for c in ['open','high','low','close','volume']:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        
-        df['Open_time'] = df['Open_time'].astype(int)
-        df = df.dropna(subset=['open','high','low','close'])
-        
-        return df.reset_index(drop=True) if len(df) >= 50 else None
-        
-    except Exception as e:
-        log.error(f"get_klines {symbol}: {e}")
+        log.error(f"testnet POST {path} error: {e}")
         return None
 
 def get_testnet_balance():
-    """Get USDT balance from testnet futures account."""
+    """Get USDT balance from Spot testnet account."""
     if not API_KEY or not API_SECRET:
-        return STARTING_BALANCE  # Return starting balance if no API keys
-    resp = binance_get("/fapi/v2/balance", {}, signed=True)
-    if isinstance(resp, list):
-        for asset in resp:
-            if asset.get("asset") == "USDT":
-                return float(asset.get("availableBalance", 0))
+        return None
+    resp = testnet_get("/api/v3/account", {}, signed=True)
+    if isinstance(resp, dict) and "balances" in resp:
+        for b in resp["balances"]:
+            if b.get("asset") == "USDT":
+                return float(b.get("free", 0))
     return None
 
-def place_market_order(symbol, side, quantity):
-    """Place market order on testnet."""
+def place_paper_order(symbol, side, alloc_usd, entry_price):
+    """
+    Pure paper trade — no actual order placed.
+    Returns a mock order_id so state tracks it cleanly.
+    If testnet keys are configured, also attempt a testnet spot order.
+    """
+    paper_id = f"paper_{symbol}_{int(time.time())}"
+
     if not API_KEY or not API_SECRET:
-        return {"orderId": f"paper_{int(time.time())}"}  # Paper trade mode
-    
+        return paper_id, False
+
+    # Spot testnet: calculate quantity in base asset
+    # Binance.US symbols always end in USDT
+    qty = round(alloc_usd / entry_price, 6)
     params = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": quantity,
+        "quantity": qty,
     }
-    resp = binance_post("/fapi/v1/order", params)
-    return resp
+    resp = testnet_post("/api/v3/order", params)
+    if isinstance(resp, dict) and "orderId" in resp:
+        return str(resp["orderId"]), True
+    else:
+        log.warning(f"Testnet order failed for {symbol}: {resp}")
+        return paper_id, False
 
-def place_sl_tp_orders(symbol, side, quantity, sl_price, tp1_price):
-    """Place SL and TP1 orders."""
+def cancel_open_orders_testnet(symbol):
     if not API_KEY or not API_SECRET:
-        return {"sl": "paper", "tp": "paper"}
-        
-    close_side = "SELL" if side == "BUY" else "BUY"
-    results = {}
-
-    # Stop Loss
-    sl_params = {
-        "symbol": symbol,
-        "side": close_side,
-        "type": "STOP_MARKET",
-        "stopPrice": round(sl_price, 4),
-        "quantity": quantity,
-        "reduceOnly": "true",
-        "timeInForce": "GTE_GTC",
-    }
-    results["sl"] = binance_post("/fapi/v1/order", sl_params)
-
-    # Take Profit
-    tp_params = {
-        "symbol": symbol,
-        "side": close_side,
-        "type": "TAKE_PROFIT_MARKET",
-        "stopPrice": round(tp1_price, 4),
-        "quantity": quantity,
-        "reduceOnly": "true",
-        "timeInForce": "GTE_GTC",
-    }
-    results["tp"] = binance_post("/fapi/v1/order", tp_params)
-    return results
-
-def cancel_open_orders(symbol):
-    if not API_KEY or not API_SECRET:
-        return {}
-    params = {"symbol": symbol}
-    return binance_post("/fapi/v1/allOpenOrders", params)
+        return
+    try:
+        testnet_post("/api/v3/openOrders", {"symbol": symbol})
+    except: pass
 
 # ══════════════════════════════════════════════════════════════════
-# INDICATORS (same as backtest)
+# INDICATORS
 # ══════════════════════════════════════════════════════════════════
 def compute_indicators(df):
     d = df.copy()
@@ -328,23 +326,15 @@ def compute_indicators(df):
 def get_htf_trend(symbol):
     scores = {"BULL": 0, "BEAR": 0}
     for tf, lim, w in [("4h", 80, 2), ("1d", 40, 1)]:
-        try:
-            url = "https://fapi.binance.com/fapi/v1/klines"
-            r = SESSION.get(url,
-                params={"symbol": symbol, "interval": tf, "limit": lim}, timeout=10)
-            rows = r.json()
-            if not rows or isinstance(rows, dict) or len(rows) < 40: continue
-            df = pd.DataFrame(rows, columns=[
-                'Open_time','open','high','low','close','volume',
-                'Close_time','qav','num_trades','taker_base','taker_quote','ignore'])
-            df['close'] = pd.to_numeric(df['close'])
-            c = df['close']
-            e20 = c.ewm(span=20, adjust=False).mean()
-            e50 = c.ewm(span=50, adjust=False).mean()
-            lc = c.iloc[-1]
-            if lc > e20.iloc[-1] > e50.iloc[-1]: scores["BULL"] += w
-            elif lc < e20.iloc[-1] < e50.iloc[-1]: scores["BEAR"] += w
-        except: pass
+        df = get_htf_klines(symbol, tf, lim)
+        if df is None or len(df) < 40:
+            continue
+        c = df['close']
+        e20 = c.ewm(span=20, adjust=False).mean()
+        e50 = c.ewm(span=50, adjust=False).mean()
+        lc = c.iloc[-1]
+        if lc > e20.iloc[-1] > e50.iloc[-1]: scores["BULL"] += w
+        elif lc < e20.iloc[-1] < e50.iloc[-1]: scores["BEAR"] += w
         time.sleep(0.06)
     if scores["BULL"] >= 2: return "BULL", min(scores["BULL"], 3)
     if scores["BEAR"] >= 2: return "BEAR", min(scores["BEAR"], 3)
@@ -453,10 +443,9 @@ def calculate_levels(df, i, direction, entry):
     return sl, tp1, tp2, sl_pct, tp1_pct, rr
 
 # ══════════════════════════════════════════════════════════════════
-# TRADE MONITOR — check open trades for SL/TP hit
+# TRADE MONITOR
 # ══════════════════════════════════════════════════════════════════
 def monitor_open_trades():
-    """Called every minute — check price vs SL/TP for each open trade."""
     with _lock:
         state = load_state()
 
@@ -465,13 +454,9 @@ def monitor_open_trades():
 
     closed_ids = []
     for trade in state["open_trades"]:
-        sym  = trade["symbol"]
-        try:
-            url = "https://fapi.binance.com/fapi/v1/ticker/price"
-            r = SESSION.get(url, params={"symbol": sym}, timeout=6)
-            price = float(r.json()["price"])
-        except Exception as e:
-            add_log(state, f"Price check error {sym}: {e}", "WARN")
+        sym   = trade["symbol"]
+        price = get_price(sym)
+        if price is None:
             continue
 
         direction = trade["direction"]
@@ -483,11 +468,9 @@ def monitor_open_trades():
         outcome = None
         pnl_pct = 0.0
 
-        # ── TP2 logic ──
         if direction == "LONG":
             if not trade.get("tp1_hit") and price >= tp1:
                 trade["tp1_hit"] = True
-                add_log(state, f"🎯 {sym} TP1 hit at {price:.4f}", "INFO")
             if trade.get("tp1_hit") and price >= tp2:
                 outcome = "TP2_HIT"
                 pnl_pct = ((tp1-entry)/entry*100)*0.5 + ((tp2-entry)/entry*100)*0.5
@@ -501,7 +484,6 @@ def monitor_open_trades():
         else:
             if not trade.get("tp1_hit") and price <= tp1:
                 trade["tp1_hit"] = True
-                add_log(state, f"🎯 {sym} TP1 hit at {price:.4f}", "INFO")
             if trade.get("tp1_hit") and price <= tp2:
                 outcome = "TP2_HIT"
                 pnl_pct = ((entry-tp1)/entry*100)*0.5 + ((entry-tp2)/entry*100)*0.5
@@ -519,36 +501,29 @@ def monitor_open_trades():
                 pnl_usd = alloc * abs(pnl_pct) / 100
             elif outcome == "SL_HIT":
                 pnl_usd = -alloc * abs(pnl_pct) / 100
-            else:  # BREAKEVEN
+            else:
                 pnl_usd = alloc * abs(pnl_pct) / 100
 
             with _lock:
                 state = load_state()
-                # Find the trade again (state may have changed)
-                for t in state["open_trades"]:
-                    if t["id"] == trade["id"]:
-                        state["balance"] = round(state["balance"] + pnl_usd, 2)
-                        state["total_pnl"] = round(state.get("total_pnl", 0) + pnl_usd, 2)
-                        if outcome == "TP2_HIT": state["wins"] += 1
-                        elif outcome == "BREAKEVEN": state["bes"] += 1
-                        else: state["losses"] += 1
+                state["balance"] = round(state["balance"] + pnl_usd, 2)
+                state["total_pnl"] = round(state.get("total_pnl", 0) + pnl_usd, 2)
+                if outcome == "TP2_HIT": state["wins"] += 1
+                elif outcome == "BREAKEVEN": state["bes"] += 1
+                else: state["losses"] += 1
 
-                        t["outcome"]   = outcome
-                        t["pnl_usd"]   = round(pnl_usd, 2)
-                        t["pnl_pct"]   = round(pnl_pct, 3)
-                        t["close_time"]= datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-                        t["exit_price"]= price
-                        state["closed_trades"].insert(0, t)
-                        state["closed_trades"] = state["closed_trades"][:500]
-                        closed_ids.append(t["id"])
+                trade["outcome"]    = outcome
+                trade["pnl_usd"]    = round(pnl_usd, 2)
+                trade["pnl_pct"]    = round(pnl_pct, 3)
+                trade["close_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+                trade["exit_price"] = price
+                state["closed_trades"].insert(0, trade)
+                state["closed_trades"] = state["closed_trades"][:500]
+                closed_ids.append(trade["id"])
 
-                        em = "✅" if outcome=="TP2_HIT" else "🟡" if outcome=="BREAKEVEN" else "❌"
-                        add_log(state, f"{em} {sym} {direction} → {outcome} | P&L: ${pnl_usd:+.2f} | Bal: ${state['balance']:.2f}")
-                        break
+                em = "✅" if outcome=="TP2_HIT" else "🟡" if outcome=="BREAKEVEN" else "❌"
+                add_log(state, f"{em} {sym} {direction} → {outcome} | P&L: ${pnl_usd:+.2f} | Bal: ${state['balance']:.2f}")
                 save_state(state)
-
-            # Cancel remaining orders on testnet
-            cancel_open_orders(sym)
 
             tg(f"{em} *{sym} {direction} — {outcome}*\n"
                f"Entry: `${entry:.4f}` → Exit: `${price:.4f}`\n"
@@ -560,6 +535,29 @@ def monitor_open_trades():
             state = load_state()
             state["open_trades"] = [t for t in state["open_trades"] if t["id"] not in closed_ids]
             save_state(state)
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIDENCE ESCALATION
+# ══════════════════════════════════════════════════════════════════
+def check_escalation(state, sym, direction, score, entry, sl, tp1, tp2, reasons):
+    for trade in state["open_trades"]:
+        if trade["symbol"] == sym and trade["direction"] == direction:
+            if score > trade["score"] + 1:
+                is_better = (direction == "LONG" and entry > trade["entry"]) or \
+                            (direction == "SHORT" and entry < trade["entry"])
+                if not is_better: return False
+
+                avail = state["balance"] - sum(t["alloc_usd"] for t in state["open_trades"])
+                extra = min(avail * 0.05, state["balance"] * 0.05)
+                if extra < MIN_TRADE_USDT: return False
+
+                trade["alloc_usd"] = round(trade["alloc_usd"] + extra, 2)
+                trade["score"] = score
+                trade["notes"] = trade.get("notes", "") + f" +PYRAMID@{entry:.4f}"
+                add_log(state, f"🔼 PYRAMID {sym} {direction} +${extra:.2f} (score↑{score})")
+                save_state(state)
+                return True
+    return False
 
 # ══════════════════════════════════════════════════════════════════
 # MAIN SCAN LOOP
@@ -596,7 +594,6 @@ def scan_once():
         if len(state["open_trades"]) >= MAX_OPEN_TRADES: break
         if state.get("signals_today", 0) >= MAX_SIGNALS_DAY: break
 
-        # Skip if already have trade on this coin
         existing = [t for t in state["open_trades"] if t["symbol"] == coin]
         if len(existing) >= 2: continue
 
@@ -605,7 +602,7 @@ def scan_once():
 
         df_raw = get_klines(coin, "1h", DATA_LIMIT)
         if df_raw is None:
-            add_log(state, f"⚠️ No klines for {coin}", "WARN")
+            add_log(state, f"⚠️ {coin} — klines failed, skipping", "WARN")
             continue
 
         df = compute_indicators(df_raw)
@@ -625,7 +622,11 @@ def scan_once():
             sl, tp1, tp2, sl_pct, tp1_pct, rr = calculate_levels(df, i, direction, entry)
             if rr < MIN_RR: continue
 
-            # Allocation based on score
+            with _lock:
+                state = load_state()
+                escalated = check_escalation(state, coin, direction, score, entry, sl, tp1, tp2, reasons)
+            if escalated: continue
+
             alloc_pct = SCORE_ALLOC.get(min(max(score, 6), 10), 4.0)
             with _lock:
                 state = load_state()
@@ -638,22 +639,8 @@ def scan_once():
                 add_log(state, f"⚠️ {coin} skip — alloc ${alloc_usd:.2f} < min")
                 continue
 
-            # ── Place order on testnet (or paper if no API keys) ──
-            qty = round(alloc_usd / entry, 6)
             side = "BUY" if direction == "LONG" else "SELL"
-
-            order_ok = False
-            if API_KEY and API_SECRET:
-                order_resp = place_market_order(coin, side, qty)
-                order_ok = isinstance(order_resp, dict) and "orderId" in order_resp
-                if order_ok:
-                    sl_tp_resp = place_sl_tp_orders(coin, side, qty, sl, tp1)
-                    add_log(state, f"📋 SL/TP placed for {coin}")
-                else:
-                    add_log(state, f"⚠️ {coin} order failed: {order_resp}", "WARN")
-            else:
-                add_log(state, f"📝 Paper mode: {coin} {direction} signal (no API keys)", "WARN")
-                order_ok = False
+            order_id, order_ok = place_paper_order(coin, side, alloc_usd, entry)
 
             trade = {
                 "id":        f"{coin}_{direction}_{int(time.time())}",
@@ -672,6 +659,7 @@ def scan_once():
                 "htf":       htf_trend,
                 "reasons":   reasons[:6],
                 "open_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+                "order_id":  order_id,
                 "order_ok":  order_ok,
                 "tp1_hit":   False,
                 "outcome":   "OPEN",
@@ -681,7 +669,7 @@ def scan_once():
                 state = load_state()
                 state["open_trades"].append(trade)
                 state["signals_today"] = state.get("signals_today", 0) + 1
-                add_log(state, f"{'📈' if direction=='LONG' else '📉'} NEW {direction} {coin} | Score:{score} Alloc:${alloc_usd:.2f} | RR:1:{rr:.1f}")
+                add_log(state, f"{'📈' if direction=='LONG' else '📉'} NEW {direction} {coin} | Score:{score} Alloc:${alloc_usd:.2f} | {'✅ Testnet order' if order_ok else '📝 Paper only'}")
                 save_state(state)
 
             tg(f"{'📈' if direction=='LONG' else '📉'} *{direction} {coin}*\n"
@@ -689,7 +677,8 @@ def scan_once():
                f"Entry `${entry:.4f}` | SL `${sl:.4f}`\n"
                f"TP1 `${tp1:.4f}` | TP2 `${tp2:.4f}`\n"
                f"Alloc: `${alloc_usd:.2f}` ({alloc_pct:.0f}%)\n"
-               f"_{' | '.join(reasons[:4])}_")
+               f"_{' | '.join(reasons[:4])}_\n"
+               f"{'✅ Testnet order placed' if order_ok else '📝 Signal tracked (paper)'}")
 
             found += 1
             time.sleep(0.5)
@@ -697,10 +686,7 @@ def scan_once():
     with _lock:
         state = load_state()
         state["bot_status"] = "idle"
-        if found == 0:
-            add_log(state, f"🔍 Scan done — No signals found | Open: {len(state['open_trades'])}")
-        else:
-            add_log(state, f"✅ Scan done — {found} new signals | Open: {len(state['open_trades'])}")
+        add_log(state, f"✅ Scan done — {found} new signals | Open: {len(state['open_trades'])}")
         save_state(state)
 
 # ══════════════════════════════════════════════════════════════════
@@ -711,27 +697,19 @@ def run():
     with _lock:
         state = load_state()
         state["bot_status"] = "running"
-        if not API_KEY or not API_SECRET:
-            add_log(state, "⚠️ No API keys found — running in PAPER mode (signals only, no orders)")
-        else:
-            add_log(state, "🚀 Bot started — Binance Testnet Paper Trading")
+        add_log(state, "🚀 Bot started — Paper Trading (Public Data + Testnet)")
         save_state(state)
 
     tg("🚀 *Paper Trading Bot Started*\n"
-       f"Balance: `${STARTING_BALANCE:,.0f}` USDT (Testnet)\n"
+       f"Balance: `${STARTING_BALANCE:,.0f}` USDT\n"
        f"Coins: `{len(WATCH_LIST)}` | Max trades: `{MAX_OPEN_TRADES}`\n"
-       f"Signals/day target: `{MAX_SIGNALS_DAY}`")
+       f"Data: `api.binance.us` | Orders: `testnet.binance.vision`")
 
-    # Run initial scan immediately
-    scan_once()
-    
-    scan_counter = 1
+    scan_counter = 0
     while True:
         try:
-            # Monitor every minute
             monitor_open_trades()
 
-            # Scan every 15 minutes (every 15 iterations)
             if scan_counter % 15 == 0:
                 scan_once()
 
@@ -742,14 +720,8 @@ def run():
             log.info("Bot stopped")
             break
         except Exception as e:
-            error_msg = str(e)
-            log.error(f"Main loop error: {error_msg}")
-            with _lock:
-                state = load_state()
-                set_error(state, error_msg)
-                state["bot_status"] = "error"
-                save_state(state)
-            time.sleep(60)
+            log.error(f"Main loop error: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     run()
