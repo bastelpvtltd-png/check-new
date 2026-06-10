@@ -318,16 +318,13 @@ def sync_positions_with_binance(state):
                         sl_val, tp1_val, tp2_val, sl_pct_val, tp1_pct_val, rr_val = \
                             calculate_levels(df_ind, i, direction, entry_price)
 
-                        # Binance ලා TP/SL orders place කිරීම
+                        # Binance ලා SL + TP1 orders place කිරීම (closePosition=true only)
                         info = get_exchange_info(sym)
                         if info and sl_val > 0:
                             close_side = "SELL" if direction == "LONG" else "BUY"
                             sl_price  = round_step(sl_val,  info["tickSize"])
                             tp1_price = round_step(tp1_val, info["tickSize"])
-                            tp2_price = round_step(tp2_val, info["tickSize"])
-                            half_qty  = round_step(qty * 0.5, info["stepSize"])
-                            if half_qty <= 0:
-                                half_qty = qty
+                            half_qty  = qty  # full qty for closePosition orders
 
                             # SL — closePosition=true
                             sl_resp = fapi_post("/fapi/v1/order", {
@@ -346,56 +343,22 @@ def sync_positions_with_binance(state):
                                 add_error(state, f"SYNC SL failed {sym}: {sl_resp}")
                             time.sleep(0.3)
 
-                            # TP1 — partial 50% qty
-                            use_partial = (half_qty * tp1_price) >= info.get("minNotional", 5)
-                            if use_partial:
-                                tp1_resp = fapi_post("/fapi/v1/order", {
-                                    "symbol":       sym,
-                                    "side":         close_side,
-                                    "type":         "TAKE_PROFIT_MARKET",
-                                    "stopPrice":    tp1_price,
-                                    "quantity":     half_qty,
-                                    "reduceOnly":   "true",
-                                    "positionSide": "BOTH",
-                                    "timeInForce":  "GTC",
-                                })
-                            else:
-                                tp1_resp = fapi_post("/fapi/v1/order", {
-                                    "symbol":        sym,
-                                    "side":          close_side,
-                                    "type":          "TAKE_PROFIT_MARKET",
-                                    "stopPrice":     tp1_price,
-                                    "closePosition": "true",
-                                    "positionSide":  "BOTH",
-                                    "timeInForce":   "GTC",
-                                })
+                            # TP1 — closePosition=true (no reduceOnly on testnet)
+                            tp1_resp = fapi_post("/fapi/v1/order", {
+                                "symbol":        sym,
+                                "side":          close_side,
+                                "type":          "TAKE_PROFIT_MARKET",
+                                "stopPrice":     tp1_price,
+                                "closePosition": "true",
+                                "positionSide":  "BOTH",
+                                "timeInForce":   "GTC",
+                            })
                             if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
                                 tp1_order_id = str(tp1_resp["orderId"])
                                 add_log(state, f"✅ SYNC TP1 placed {sym} @ {tp1_price}")
                             else:
                                 add_error(state, f"SYNC TP1 failed {sym}: {tp1_resp}")
-                            time.sleep(0.3)
-
-                            # TP2 — remaining 50% (only if TP1 was partial)
-                            if use_partial and half_qty > 0:
-                                remaining_qty = round_step(qty - half_qty, info["stepSize"])
-                                if remaining_qty <= 0:
-                                    remaining_qty = half_qty
-                                tp2_resp = fapi_post("/fapi/v1/order", {
-                                    "symbol":       sym,
-                                    "side":         close_side,
-                                    "type":         "TAKE_PROFIT_MARKET",
-                                    "stopPrice":    tp2_price,
-                                    "quantity":     remaining_qty,
-                                    "reduceOnly":   "true",
-                                    "positionSide": "BOTH",
-                                    "timeInForce":  "GTC",
-                                })
-                                if isinstance(tp2_resp, dict) and "orderId" in tp2_resp:
-                                    tp2_order_id = str(tp2_resp["orderId"])
-                                    add_log(state, f"✅ SYNC TP2 placed {sym} @ {tp2_price}")
-                                else:
-                                    add_error(state, f"SYNC TP2 failed {sym}: {tp2_resp}")
+                            # TP2 = software monitor only (no separate Binance order)
                 except Exception as e:
                     add_error(state, f"SYNC SL/TP calc error {sym}: {e}")
 
@@ -652,12 +615,14 @@ def calculate_levels(df, i, direction, entry):
 # ═══════════════════════════════════════════════
 # PLACE FUTURES ORDER — FIXED (no workingType)
 # ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════
+# PLACE FUTURES ORDER
+# SL  → STOP_MARKET       closePosition=true  (Binance handles)
+# TP1 → TAKE_PROFIT_MARKET closePosition=true  (Binance closes full @ TP1)
+# TP2 → bot monitor ලා track කරලා market close  (software level)
+# NOTE: reduceOnly testnet ලා reject කරනවා — use නොකරන්නේ
+# ═══════════════════════════════════════════════
 def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=None):
-    """
-    Entry + SL (closePosition=true) + TP1 (50% qty) + TP2 (50% qty).
-    TP1/TP2 partial quantities use reduceOnly=true so they don't open new positions.
-    SL uses closePosition=true to always cover the remaining position.
-    """
     state = load_state()
     set_leverage(symbol, LEVERAGE)
 
@@ -695,12 +660,12 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
 
     order_id = str(entry_resp["orderId"])
     log.info(f"Entry: {symbol} {side} qty={qty} id={order_id}")
-    time.sleep(0.5)  # wait for position to register
+    time.sleep(0.5)
 
     sl_price  = round_step(sl,  info["tickSize"])
     tp1_price = round_step(tp1, info["tickSize"])
 
-    # ── 2. Stop-Loss → closePosition=true (always closes full remaining position) ──
+    # ── 2. Stop-Loss → closePosition=true ──
     sl_resp = fapi_post("/fapi/v1/order", {
         "symbol":        symbol,
         "side":          close_side,
@@ -720,93 +685,34 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
 
     time.sleep(0.3)
 
-    # ── 3. TP1 → 50% qty partial close (reduceOnly) ──
-    # Half qty round down to step size
-    half_qty = round_step(qty * 0.5, info["stepSize"])
-    # Ensure half_qty meets min notional; fallback to closePosition if too small
-    use_partial_tp = (half_qty * tp1_price) >= info.get("minNotional", 5) and half_qty > 0
-
+    # ── 3. TP1 → closePosition=true (Binance closes full position @ TP1) ──
+    #    TP2 is tracked by bot monitor in software — when price reaches tp2
+    #    after tp1 would have closed, the bot records it as TP2_HIT via AUTO_CLOSED.
+    #    If you want split TP, enable OCO/bracket orders on live (not testnet).
+    tp1_resp = fapi_post("/fapi/v1/order", {
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "TAKE_PROFIT_MARKET",
+        "stopPrice":     tp1_price,
+        "closePosition": "true",
+        "positionSide":  "BOTH",
+        "timeInForce":   "GTC",
+    })
     tp1_order_id = ""
-    if use_partial_tp:
-        tp1_resp = fapi_post("/fapi/v1/order", {
-            "symbol":       symbol,
-            "side":         close_side,
-            "type":         "TAKE_PROFIT_MARKET",
-            "stopPrice":    tp1_price,
-            "quantity":     half_qty,
-            "reduceOnly":   "true",
-            "positionSide": "BOTH",
-            "timeInForce":  "GTC",
-        })
-        if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
-            tp1_order_id = str(tp1_resp["orderId"])
-            log.info(f"TP1 placed: {symbol} @ {tp1_price} qty={half_qty} id={tp1_order_id}")
-        else:
-            add_error(state, f"{symbol} TP1 partial failed: {tp1_resp} — falling back to closePosition")
-            save_state(state)
-            # Fallback: closePosition=true
-            tp1_fb = fapi_post("/fapi/v1/order", {
-                "symbol":        symbol,
-                "side":          close_side,
-                "type":          "TAKE_PROFIT_MARKET",
-                "stopPrice":     tp1_price,
-                "closePosition": "true",
-                "positionSide":  "BOTH",
-                "timeInForce":   "GTC",
-            })
-            if isinstance(tp1_fb, dict) and "orderId" in tp1_fb:
-                tp1_order_id = str(tp1_fb["orderId"])
-                use_partial_tp = False  # signal that TP2 should not be placed
+    if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
+        tp1_order_id = str(tp1_resp["orderId"])
+        log.info(f"TP1 placed: {symbol} @ {tp1_price} id={tp1_order_id}")
     else:
-        # qty too small for partial — use closePosition=true for TP1
-        tp1_resp = fapi_post("/fapi/v1/order", {
-            "symbol":        symbol,
-            "side":          close_side,
-            "type":          "TAKE_PROFIT_MARKET",
-            "stopPrice":     tp1_price,
-            "closePosition": "true",
-            "positionSide":  "BOTH",
-            "timeInForce":   "GTC",
-        })
-        if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
-            tp1_order_id = str(tp1_resp["orderId"])
-            log.info(f"TP1 (full) placed: {symbol} @ {tp1_price} id={tp1_order_id}")
-
-    time.sleep(0.3)
-
-    # ── 4. TP2 → remaining 50% partial close (only if TP1 was partial) ──
-    tp2_order_id = ""
-    if tp2 and use_partial_tp and half_qty > 0:
-        tp2_price = round_step(tp2, info["tickSize"])
-        # Remaining qty = total - half (remaining half, also rounded)
-        remaining_qty = round_step(qty - half_qty, info["stepSize"])
-        if remaining_qty <= 0:
-            remaining_qty = half_qty  # safety fallback
-
-        tp2_resp = fapi_post("/fapi/v1/order", {
-            "symbol":       symbol,
-            "side":         close_side,
-            "type":         "TAKE_PROFIT_MARKET",
-            "stopPrice":    tp2_price,
-            "quantity":     remaining_qty,
-            "reduceOnly":   "true",
-            "positionSide": "BOTH",
-            "timeInForce":  "GTC",
-        })
-        if isinstance(tp2_resp, dict) and "orderId" in tp2_resp:
-            tp2_order_id = str(tp2_resp["orderId"])
-            log.info(f"TP2 placed: {symbol} @ {tp2_price} qty={remaining_qty} id={tp2_order_id}")
-        else:
-            add_error(state, f"{symbol} TP2 failed: {tp2_resp}")
-            save_state(state)
+        add_error(state, f"{symbol} TP1 failed: {tp1_resp}")
+        save_state(state)
 
     return {
         "order_id":     order_id,
         "sl_order_id":  sl_order_id,
-        "tp_order_id":  tp1_order_id,   # TP1 order id (backward compat field name)
-        "tp2_order_id": tp2_order_id,
+        "tp_order_id":  tp1_order_id,
+        "tp2_order_id": "",          # TP2 = software monitor only
         "qty":          qty,
-        "half_qty":     half_qty if use_partial_tp else qty,
+        "half_qty":     qty,
         "notional":     round(notional, 2),
     }, "ok"
 
@@ -846,73 +752,19 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
 
     time.sleep(0.2)
 
-    qty      = trade.get("qty", 0)
-    half_qty = trade.get("half_qty", round_step(qty * 0.5, info["stepSize"]))
-    use_partial = (half_qty * tp1_price) >= info.get("minNotional", 5) and half_qty > 0
+    # TP1 — closePosition=true (no reduceOnly on testnet)
+    tp1_resp = fapi_post("/fapi/v1/order", {
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "TAKE_PROFIT_MARKET",
+        "stopPrice":     tp1_price,
+        "closePosition": "true",
+        "positionSide":  "BOTH",
+        "timeInForce":   "GTC",
+    })
+    new_tp1_id = str(tp1_resp.get("orderId", "")) if isinstance(tp1_resp, dict) and "orderId" in tp1_resp else ""
 
-    new_tp1_id = ""
-    if use_partial:
-        tp1_resp = fapi_post("/fapi/v1/order", {
-            "symbol":       symbol,
-            "side":         close_side,
-            "type":         "TAKE_PROFIT_MARKET",
-            "stopPrice":    tp1_price,
-            "quantity":     half_qty,
-            "reduceOnly":   "true",
-            "positionSide": "BOTH",
-            "timeInForce":  "GTC",
-        })
-        if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
-            new_tp1_id = str(tp1_resp["orderId"])
-        else:
-            # fallback closePosition
-            tp1_fb = fapi_post("/fapi/v1/order", {
-                "symbol":        symbol,
-                "side":          close_side,
-                "type":          "TAKE_PROFIT_MARKET",
-                "stopPrice":     tp1_price,
-                "closePosition": "true",
-                "positionSide":  "BOTH",
-                "timeInForce":   "GTC",
-            })
-            if isinstance(tp1_fb, dict) and "orderId" in tp1_fb:
-                new_tp1_id = str(tp1_fb["orderId"])
-            use_partial = False
-    else:
-        tp1_resp = fapi_post("/fapi/v1/order", {
-            "symbol":        symbol,
-            "side":          close_side,
-            "type":          "TAKE_PROFIT_MARKET",
-            "stopPrice":     tp1_price,
-            "closePosition": "true",
-            "positionSide":  "BOTH",
-            "timeInForce":   "GTC",
-        })
-        if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
-            new_tp1_id = str(tp1_resp["orderId"])
-
-    time.sleep(0.2)
-
-    new_tp2_id = ""
-    if new_tp2 and use_partial and half_qty > 0:
-        tp2_price     = round_step(new_tp2, info["tickSize"])
-        remaining_qty = round_step(qty - half_qty, info["stepSize"])
-        if remaining_qty <= 0:
-            remaining_qty = half_qty
-        tp2_resp = fapi_post("/fapi/v1/order", {
-            "symbol":       symbol,
-            "side":         close_side,
-            "type":         "TAKE_PROFIT_MARKET",
-            "stopPrice":    tp2_price,
-            "quantity":     remaining_qty,
-            "reduceOnly":   "true",
-            "positionSide": "BOTH",
-            "timeInForce":  "GTC",
-        })
-        if isinstance(tp2_resp, dict) and "orderId" in tp2_resp:
-            new_tp2_id = str(tp2_resp["orderId"])
-
-    return new_sl_id, new_tp1_id, new_tp2_id
+    return new_sl_id, new_tp1_id, ""  # tp2 = software monitor only
 
 # ═══════════════════════════════════════════════
 # MANUAL CLOSE (from dashboard)
@@ -1026,46 +878,18 @@ def monitor_open_trades():
                         new_sl_id = str(sl_r["orderId"]) if isinstance(sl_r, dict) and "orderId" in sl_r else ""
                         time.sleep(0.3)
 
-                        use_partial = half_qty_t > 0 and (half_qty_t * new_tp1) >= info.get("minNotional", 5)
-                        if use_partial:
-                            tp1_r = fapi_post("/fapi/v1/order", {
-                                "symbol":       sym,
-                                "side":         close_side,
-                                "type":         "TAKE_PROFIT_MARKET",
-                                "stopPrice":    round_step(new_tp1, info["tickSize"]),
-                                "quantity":     half_qty_t,
-                                "reduceOnly":   "true",
-                                "positionSide": "BOTH",
-                                "timeInForce":  "GTC",
-                            })
-                        else:
-                            tp1_r = fapi_post("/fapi/v1/order", {
-                                "symbol":        sym,
-                                "side":          close_side,
-                                "type":          "TAKE_PROFIT_MARKET",
-                                "stopPrice":     round_step(new_tp1, info["tickSize"]),
-                                "closePosition": "true",
-                                "positionSide":  "BOTH",
-                                "timeInForce":   "GTC",
-                            })
+                        # TP1 — closePosition=true (no reduceOnly on testnet)
+                        tp1_r = fapi_post("/fapi/v1/order", {
+                            "symbol":        sym,
+                            "side":          close_side,
+                            "type":          "TAKE_PROFIT_MARKET",
+                            "stopPrice":     round_step(new_tp1, info["tickSize"]),
+                            "closePosition": "true",
+                            "positionSide":  "BOTH",
+                            "timeInForce":   "GTC",
+                        })
                         new_tp1_id = str(tp1_r["orderId"]) if isinstance(tp1_r, dict) and "orderId" in tp1_r else ""
-                        time.sleep(0.3)
-
-                        new_tp2_id = ""
-                        if use_partial and half_qty_t > 0:
-                            rem_qty = round_step(qty_t - half_qty_t, info["stepSize"])
-                            if rem_qty <= 0: rem_qty = half_qty_t
-                            tp2_r = fapi_post("/fapi/v1/order", {
-                                "symbol":       sym,
-                                "side":         close_side,
-                                "type":         "TAKE_PROFIT_MARKET",
-                                "stopPrice":    round_step(new_tp2, info["tickSize"]),
-                                "quantity":     rem_qty,
-                                "reduceOnly":   "true",
-                                "positionSide": "BOTH",
-                                "timeInForce":  "GTC",
-                            })
-                            new_tp2_id = str(tp2_r["orderId"]) if isinstance(tp2_r, dict) and "orderId" in tp2_r else ""
+                        new_tp2_id = ""  # TP2 = software monitor only
 
                         # Update trade state
                         with _lock:
@@ -1078,10 +902,10 @@ def monitor_open_trades():
                                     t["sl_pct"]       = round(sl_pct_,  3)
                                     t["tp1_pct"]      = round(tp1_pct_, 3)
                                     t["rr"]           = round(rr_,      2)
-                                    t["half_qty"]     = half_qty_t
+                                    t["half_qty"]     = qty_t
                                     t["sl_order_id"]  = new_sl_id
                                     t["tp_order_id"]  = new_tp1_id
-                                    t["tp2_order_id"] = new_tp2_id
+                                    t["tp2_order_id"] = ""
                                     break
                             add_log(state2, f"🔧 RETRY SL/TP {sym} {direction} | SL={new_sl:.4f} TP1={new_tp1:.4f} TP2={new_tp2:.4f}")
                             save_state(state2)
