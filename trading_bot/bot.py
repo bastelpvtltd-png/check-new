@@ -302,34 +302,133 @@ def sync_positions_with_binance(state):
             existing = [t for t in state["open_trades"]
                         if t["symbol"] == sym and t["direction"] == direction]
             if not existing and entry_price > 0:
+                qty = abs(amt)
+
+                # ── SL/TP calculate කිරීම ──
+                sl_val = tp1_val = tp2_val = 0.0
+                sl_pct_val = tp1_pct_val = rr_val = 0.0
+                sl_order_id = tp1_order_id = tp2_order_id = ""
+                half_qty = qty
+
+                try:
+                    df_raw = get_klines(sym, "1h", DATA_LIMIT)
+                    if df_raw is not None and len(df_raw) >= 50:
+                        df_ind = compute_indicators(df_raw)
+                        i = len(df_ind) - 1
+                        sl_val, tp1_val, tp2_val, sl_pct_val, tp1_pct_val, rr_val = \
+                            calculate_levels(df_ind, i, direction, entry_price)
+
+                        # Binance ලා TP/SL orders place කිරීම
+                        info = get_exchange_info(sym)
+                        if info and sl_val > 0:
+                            close_side = "SELL" if direction == "LONG" else "BUY"
+                            sl_price  = round_step(sl_val,  info["tickSize"])
+                            tp1_price = round_step(tp1_val, info["tickSize"])
+                            tp2_price = round_step(tp2_val, info["tickSize"])
+                            half_qty  = round_step(qty * 0.5, info["stepSize"])
+                            if half_qty <= 0:
+                                half_qty = qty
+
+                            # SL — closePosition=true
+                            sl_resp = fapi_post("/fapi/v1/order", {
+                                "symbol":        sym,
+                                "side":          close_side,
+                                "type":          "STOP_MARKET",
+                                "stopPrice":     sl_price,
+                                "closePosition": "true",
+                                "positionSide":  "BOTH",
+                                "timeInForce":   "GTC",
+                            })
+                            if isinstance(sl_resp, dict) and "orderId" in sl_resp:
+                                sl_order_id = str(sl_resp["orderId"])
+                                add_log(state, f"✅ SYNC SL placed {sym} @ {sl_price}")
+                            else:
+                                add_error(state, f"SYNC SL failed {sym}: {sl_resp}")
+                            time.sleep(0.3)
+
+                            # TP1 — partial 50% qty
+                            use_partial = (half_qty * tp1_price) >= info.get("minNotional", 5)
+                            if use_partial:
+                                tp1_resp = fapi_post("/fapi/v1/order", {
+                                    "symbol":       sym,
+                                    "side":         close_side,
+                                    "type":         "TAKE_PROFIT_MARKET",
+                                    "stopPrice":    tp1_price,
+                                    "quantity":     half_qty,
+                                    "reduceOnly":   "true",
+                                    "positionSide": "BOTH",
+                                    "timeInForce":  "GTC",
+                                })
+                            else:
+                                tp1_resp = fapi_post("/fapi/v1/order", {
+                                    "symbol":        sym,
+                                    "side":          close_side,
+                                    "type":          "TAKE_PROFIT_MARKET",
+                                    "stopPrice":     tp1_price,
+                                    "closePosition": "true",
+                                    "positionSide":  "BOTH",
+                                    "timeInForce":   "GTC",
+                                })
+                            if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
+                                tp1_order_id = str(tp1_resp["orderId"])
+                                add_log(state, f"✅ SYNC TP1 placed {sym} @ {tp1_price}")
+                            else:
+                                add_error(state, f"SYNC TP1 failed {sym}: {tp1_resp}")
+                            time.sleep(0.3)
+
+                            # TP2 — remaining 50% (only if TP1 was partial)
+                            if use_partial and half_qty > 0:
+                                remaining_qty = round_step(qty - half_qty, info["stepSize"])
+                                if remaining_qty <= 0:
+                                    remaining_qty = half_qty
+                                tp2_resp = fapi_post("/fapi/v1/order", {
+                                    "symbol":       sym,
+                                    "side":         close_side,
+                                    "type":         "TAKE_PROFIT_MARKET",
+                                    "stopPrice":    tp2_price,
+                                    "quantity":     remaining_qty,
+                                    "reduceOnly":   "true",
+                                    "positionSide": "BOTH",
+                                    "timeInForce":  "GTC",
+                                })
+                                if isinstance(tp2_resp, dict) and "orderId" in tp2_resp:
+                                    tp2_order_id = str(tp2_resp["orderId"])
+                                    add_log(state, f"✅ SYNC TP2 placed {sym} @ {tp2_price}")
+                                else:
+                                    add_error(state, f"SYNC TP2 failed {sym}: {tp2_resp}")
+                except Exception as e:
+                    add_error(state, f"SYNC SL/TP calc error {sym}: {e}")
+
                 phantom_trade = {
-                    "id":        f"{sym}_{direction}_SYNCED_{int(time.time())}",
-                    "symbol":    sym,
-                    "direction": direction,
-                    "score":     0,
-                    "entry":     entry_price,
-                    "sl":        0.0,
-                    "tp1":       0.0,
-                    "tp2":       0.0,
-                    "sl_pct":    0.0,
-                    "tp1_pct":   0.0,
-                    "rr":        0.0,
-                    "alloc_usd": abs(amt) * entry_price,
-                    "alloc_pct": 0.0,
-                    "notional":  abs(amt) * entry_price,
-                    "qty":       abs(amt),
-                    "leverage":  LEVERAGE,
-                    "htf":       "SYNC",
-                    "reasons":   ["Synced from Binance"],
-                    "open_time": dt_sl(),
-                    "order_id":  "SYNCED",
-                    "sl_order_id": "",
-                    "tp_order_id": "",
-                    "tp1_hit":   False,
-                    "outcome":   "OPEN",
+                    "id":           f"{sym}_{direction}_SYNCED_{int(time.time())}",
+                    "symbol":       sym,
+                    "direction":    direction,
+                    "score":        0,
+                    "entry":        entry_price,
+                    "sl":           round(sl_val, 6),
+                    "tp1":          round(tp1_val, 6),
+                    "tp2":          round(tp2_val, 6),
+                    "sl_pct":       round(sl_pct_val, 3),
+                    "tp1_pct":      round(tp1_pct_val, 3),
+                    "rr":           round(rr_val, 2),
+                    "alloc_usd":    qty * entry_price,
+                    "alloc_pct":    0.0,
+                    "notional":     qty * entry_price,
+                    "qty":          qty,
+                    "half_qty":     half_qty,
+                    "leverage":     LEVERAGE,
+                    "htf":          "SYNC",
+                    "reasons":      ["Synced from Binance"],
+                    "open_time":    dt_sl(),
+                    "order_id":     "SYNCED",
+                    "sl_order_id":  sl_order_id,
+                    "tp_order_id":  tp1_order_id,
+                    "tp2_order_id": tp2_order_id,
+                    "tp1_hit":      False,
+                    "outcome":      "OPEN",
                 }
                 state["open_trades"].append(phantom_trade)
-                add_log(state, f"🔄 SYNC: Added {sym} {direction} from Binance (entry=${entry_price:.4f})")
+                add_log(state, f"🔄 SYNC: Added {sym} {direction} entry=${entry_price:.4f} SL={sl_val:.4f} TP1={tp1_val:.4f}")
 
         # State ලා open නම් Binance ලා නෑ නම් → auto-closed
         to_remove = []
@@ -885,13 +984,110 @@ def monitor_open_trades():
         tp1   = trade["tp1"]
         tp2   = trade["tp2"]
 
-        # Skip synced trades with no SL/TP set (sl=0)
-        if sl == 0:
+        # SL/TP නෑ නම් (sync trade orders fail වෙලා ඇති) → retry place
+        if sl == 0 or tp1 == 0:
             if direction == "LONG":
                 live_pct = (price - entry) / entry * 100 if entry > 0 else 0
             else:
                 live_pct = (entry - price) / entry * 100 if entry > 0 else 0
-            log.info(f"MONITOR {sym} {direction} (SYNCED) price={price:.4f} pnl={live_pct:+.2f}%")
+            log.info(f"MONITOR {sym} {direction} (NO SL/TP) price={price:.4f} pnl={live_pct:+.2f}% — retrying SL/TP placement")
+
+            # Retry: calculate levels and place orders
+            try:
+                df_raw = get_klines(sym, "1h", DATA_LIMIT)
+                if df_raw is not None and len(df_raw) >= 50:
+                    df_ind = compute_indicators(df_raw)
+                    i_idx  = len(df_ind) - 1
+                    new_sl, new_tp1, new_tp2, sl_pct_, tp1_pct_, rr_ = \
+                        calculate_levels(df_ind, i_idx, direction, entry)
+                    info = get_exchange_info(sym)
+                    if info and new_sl > 0:
+                        qty_t      = trade.get("qty", 0)
+                        half_qty_t = round_step(qty_t * 0.5, info["stepSize"]) if qty_t > 0 else 0
+                        close_side = "SELL" if direction == "LONG" else "BUY"
+
+                        # Cancel any stale orders first
+                        cancel_orders(sym, [
+                            trade.get("sl_order_id"),
+                            trade.get("tp_order_id"),
+                            trade.get("tp2_order_id"),
+                        ])
+                        time.sleep(0.3)
+
+                        sl_r = fapi_post("/fapi/v1/order", {
+                            "symbol":        sym,
+                            "side":          close_side,
+                            "type":          "STOP_MARKET",
+                            "stopPrice":     round_step(new_sl, info["tickSize"]),
+                            "closePosition": "true",
+                            "positionSide":  "BOTH",
+                            "timeInForce":   "GTC",
+                        })
+                        new_sl_id = str(sl_r["orderId"]) if isinstance(sl_r, dict) and "orderId" in sl_r else ""
+                        time.sleep(0.3)
+
+                        use_partial = half_qty_t > 0 and (half_qty_t * new_tp1) >= info.get("minNotional", 5)
+                        if use_partial:
+                            tp1_r = fapi_post("/fapi/v1/order", {
+                                "symbol":       sym,
+                                "side":         close_side,
+                                "type":         "TAKE_PROFIT_MARKET",
+                                "stopPrice":    round_step(new_tp1, info["tickSize"]),
+                                "quantity":     half_qty_t,
+                                "reduceOnly":   "true",
+                                "positionSide": "BOTH",
+                                "timeInForce":  "GTC",
+                            })
+                        else:
+                            tp1_r = fapi_post("/fapi/v1/order", {
+                                "symbol":        sym,
+                                "side":          close_side,
+                                "type":          "TAKE_PROFIT_MARKET",
+                                "stopPrice":     round_step(new_tp1, info["tickSize"]),
+                                "closePosition": "true",
+                                "positionSide":  "BOTH",
+                                "timeInForce":   "GTC",
+                            })
+                        new_tp1_id = str(tp1_r["orderId"]) if isinstance(tp1_r, dict) and "orderId" in tp1_r else ""
+                        time.sleep(0.3)
+
+                        new_tp2_id = ""
+                        if use_partial and half_qty_t > 0:
+                            rem_qty = round_step(qty_t - half_qty_t, info["stepSize"])
+                            if rem_qty <= 0: rem_qty = half_qty_t
+                            tp2_r = fapi_post("/fapi/v1/order", {
+                                "symbol":       sym,
+                                "side":         close_side,
+                                "type":         "TAKE_PROFIT_MARKET",
+                                "stopPrice":    round_step(new_tp2, info["tickSize"]),
+                                "quantity":     rem_qty,
+                                "reduceOnly":   "true",
+                                "positionSide": "BOTH",
+                                "timeInForce":  "GTC",
+                            })
+                            new_tp2_id = str(tp2_r["orderId"]) if isinstance(tp2_r, dict) and "orderId" in tp2_r else ""
+
+                        # Update trade state
+                        with _lock:
+                            state2 = load_state()
+                            for t in state2["open_trades"]:
+                                if t["id"] == trade["id"]:
+                                    t["sl"]  = round(new_sl,  6)
+                                    t["tp1"] = round(new_tp1, 6)
+                                    t["tp2"] = round(new_tp2, 6)
+                                    t["sl_pct"]       = round(sl_pct_,  3)
+                                    t["tp1_pct"]      = round(tp1_pct_, 3)
+                                    t["rr"]           = round(rr_,      2)
+                                    t["half_qty"]     = half_qty_t
+                                    t["sl_order_id"]  = new_sl_id
+                                    t["tp_order_id"]  = new_tp1_id
+                                    t["tp2_order_id"] = new_tp2_id
+                                    break
+                            add_log(state2, f"🔧 RETRY SL/TP {sym} {direction} | SL={new_sl:.4f} TP1={new_tp1:.4f} TP2={new_tp2:.4f}")
+                            save_state(state2)
+            except Exception as e:
+                add_error(state, f"RETRY SL/TP error {sym}: {e}")
+                save_state(state)
             continue
 
         if direction == "LONG":
