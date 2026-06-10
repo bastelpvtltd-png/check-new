@@ -66,7 +66,8 @@ def load_state():
             "bot_status": "starting", "last_scan": "",
             "wins": 0, "losses": 0, "bes": 0,
             "total_pnl": 0.0, "log": [],
-            "errors": []
+            "errors": [],
+            "bot_running": True   # NEW: start/stop control
         }
 
 def save_state(state):
@@ -86,7 +87,7 @@ def add_error(state, msg):
     add_log(state, f"❗ {msg}", "ERROR")
 
 # ═══════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM — trade alerts only, no signal spam
 # ═══════════════════════════════════════════════
 def tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -172,6 +173,23 @@ def get_wallet_balance():
             if b.get("asset") == "USDT":
                 return float(b.get("availableBalance", 0)), float(b.get("balance", 0))
     return None, None
+
+def get_open_orders_count(symbol=None):
+    """Get count of pending/open orders from Binance."""
+    params = {}
+    if symbol:
+        params["symbol"] = symbol
+    data = fapi_get("/fapi/v1/openOrders", params, signed=True)
+    if isinstance(data, list):
+        return len(data)
+    return 0
+
+def get_all_open_orders_count():
+    """Get total pending orders count across all symbols."""
+    data = fapi_get("/fapi/v1/openOrders", {}, signed=True)
+    if isinstance(data, list):
+        return len(data)
+    return 0
 
 def get_klines(symbol, interval="1h", limit=300):
     data = fapi_get("/fapi/v1/klines", {
@@ -431,7 +449,7 @@ def calculate_levels(df, i, direction, entry):
     return sl, tp1, tp2, sl_pct, tp1_pct, rr
 
 # ═══════════════════════════════════════════════
-# PLACE FUTURES ORDER
+# PLACE FUTURES ORDER — FIXED SL/TP
 # ═══════════════════════════════════════════════
 def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
     """Place a futures market order with SL and TP on testnet."""
@@ -445,7 +463,7 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
     if not info:
         add_error(state, f"{symbol}: exchange info failed")
         save_state(state)
-        return None, f"exchange_info_fail"
+        return None, "exchange_info_fail"
 
     notional = usdt_amount * LEVERAGE
     raw_qty  = notional / entry_price
@@ -456,9 +474,10 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
         save_state(state)
         return None, "qty_too_small"
 
-    pos_side = "LONG" if side == "BUY" else "SHORT"
+    # Determine closing side
+    close_side = "SELL" if side == "BUY" else "BUY"
 
-    # Market entry
+    # ── 1. Market entry order ──
     entry_resp = fapi_post("/fapi/v1/order", {
         "symbol":       symbol,
         "side":         side,
@@ -476,31 +495,53 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
 
     order_id = str(entry_resp["orderId"])
     log.info(f"Entry order placed: {symbol} {side} qty={qty} orderId={order_id}")
+    time.sleep(0.3)  # small wait so position registers before SL/TP
 
-    # SL order
-    sl_side = "SELL" if side == "BUY" else "BUY"
-    sl_resp = fapi_post("/fapi/v1/order", {
-        "symbol":           symbol,
-        "side":             sl_side,
-        "type":             "STOP_MARKET",
-        "stopPrice":        round_step(sl, info["tickSize"]),
-        "closePosition":    "true",
-        "positionSide":     "BOTH",
-        "timeInForce":      "GTC",
-    })
-    sl_order_id = str(sl_resp.get("orderId", "")) if isinstance(sl_resp, dict) else ""
+    # ── 2. Stop-Loss order (STOP_MARKET) ──
+    sl_price = round_step(sl, info["tickSize"])
+    sl_params = {
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "STOP_MARKET",
+        "stopPrice":     sl_price,
+        "closePosition": "true",
+        "positionSide":  "BOTH",
+        "timeInForce":   "GTC",
+        "workingType":   "MARK_PRICE",   # use mark price to avoid false triggers
+    }
+    sl_resp = fapi_post("/fapi/v1/order", sl_params)
+    sl_order_id = ""
+    if isinstance(sl_resp, dict) and "orderId" in sl_resp:
+        sl_order_id = str(sl_resp["orderId"])
+        log.info(f"SL order placed: {symbol} stopPrice={sl_price} orderId={sl_order_id}")
+    else:
+        log.warning(f"SL order failed for {symbol}: {sl_resp}")
+        add_error(state, f"{symbol} SL order failed: {sl_resp}")
+        save_state(state)
 
-    # TP order
-    tp_resp = fapi_post("/fapi/v1/order", {
-        "symbol":           symbol,
-        "side":             sl_side,
-        "type":             "TAKE_PROFIT_MARKET",
-        "stopPrice":        round_step(tp1, info["tickSize"]),
-        "closePosition":    "true",
-        "positionSide":     "BOTH",
-        "timeInForce":      "GTC",
-    })
-    tp_order_id = str(tp_resp.get("orderId", "")) if isinstance(tp_resp, dict) else ""
+    time.sleep(0.2)
+
+    # ── 3. Take-Profit order (TAKE_PROFIT_MARKET) ──
+    tp_price = round_step(tp1, info["tickSize"])
+    tp_params = {
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "TAKE_PROFIT_MARKET",
+        "stopPrice":     tp_price,
+        "closePosition": "true",
+        "positionSide":  "BOTH",
+        "timeInForce":   "GTC",
+        "workingType":   "MARK_PRICE",   # use mark price
+    }
+    tp_resp = fapi_post("/fapi/v1/order", tp_params)
+    tp_order_id = ""
+    if isinstance(tp_resp, dict) and "orderId" in tp_resp:
+        tp_order_id = str(tp_resp["orderId"])
+        log.info(f"TP order placed: {symbol} stopPrice={tp_price} orderId={tp_order_id}")
+    else:
+        log.warning(f"TP order failed for {symbol}: {tp_resp}")
+        add_error(state, f"{symbol} TP order failed: {tp_resp}")
+        save_state(state)
 
     return {
         "order_id":    order_id,
@@ -512,8 +553,78 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
 
 def cancel_orders(symbol, order_ids):
     for oid in order_ids:
-        if not oid: continue
-        fapi_delete("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
+        if not oid:
+            continue
+        resp = fapi_delete("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
+        log.info(f"Cancelled order {oid} on {symbol}: {resp}")
+
+def update_sl_tp_orders(trade, new_sl, new_tp1, info):
+    """Cancel old SL/TP and place new ones with updated levels."""
+    symbol = trade["symbol"]
+    side   = trade["direction"]
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    # Cancel existing SL and TP
+    cancel_orders(symbol, [trade.get("sl_order_id"), trade.get("tp_order_id")])
+    time.sleep(0.3)
+
+    # New SL
+    sl_price = round_step(new_sl, info["tickSize"])
+    sl_resp = fapi_post("/fapi/v1/order", {
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "STOP_MARKET",
+        "stopPrice":     sl_price,
+        "closePosition": "true",
+        "positionSide":  "BOTH",
+        "timeInForce":   "GTC",
+        "workingType":   "MARK_PRICE",
+    })
+    new_sl_id = str(sl_resp.get("orderId", "")) if isinstance(sl_resp, dict) else ""
+
+    time.sleep(0.2)
+
+    # New TP
+    tp_price = round_step(new_tp1, info["tickSize"])
+    tp_resp = fapi_post("/fapi/v1/order", {
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "TAKE_PROFIT_MARKET",
+        "stopPrice":     tp_price,
+        "closePosition": "true",
+        "positionSide":  "BOTH",
+        "timeInForce":   "GTC",
+        "workingType":   "MARK_PRICE",
+    })
+    new_tp_id = str(tp_resp.get("orderId", "")) if isinstance(tp_resp, dict) else ""
+
+    return new_sl_id, new_tp_id
+
+def close_trade_market(trade):
+    """Force close a trade with a market order (for dashboard close button)."""
+    symbol    = trade["symbol"]
+    direction = trade["direction"]
+    qty       = trade.get("qty", 0)
+    close_side = "SELL" if direction == "LONG" else "BUY"
+
+    # Cancel existing SL/TP first
+    cancel_orders(symbol, [trade.get("sl_order_id"), trade.get("tp_order_id")])
+    time.sleep(0.2)
+
+    if qty <= 0:
+        return False, "qty_zero"
+
+    resp = fapi_post("/fapi/v1/order", {
+        "symbol":       symbol,
+        "side":         close_side,
+        "type":         "MARKET",
+        "quantity":     qty,
+        "positionSide": "BOTH",
+        "reduceOnly":   "true",
+    })
+    if isinstance(resp, dict) and "orderId" in resp:
+        return True, str(resp["orderId"])
+    return False, str(resp)
 
 # ═══════════════════════════════════════════════
 # MONITOR OPEN TRADES
@@ -550,7 +661,6 @@ def monitor_open_trades():
         if direction == "LONG":
             if not trade.get("tp1_hit") and price >= tp1:
                 trade["tp1_hit"] = True
-                # Cancel SL, let TP2 run or set BE SL
                 tg(f"🎯 *{sym} TP1 hit* — Moving SL to breakeven")
             if trade.get("tp1_hit") and price >= tp2:
                 outcome = "TP2_HIT"
@@ -614,11 +724,17 @@ def monitor_open_trades():
             save_state(state)
 
 # ═══════════════════════════════════════════════
-# MAIN SCAN
+# MAIN SCAN — with duplicate signal logic
 # ═══════════════════════════════════════════════
 def scan_once():
     with _lock:
         state = load_state()
+
+    # If bot is stopped via dashboard, skip scan
+    if not state.get("bot_running", True):
+        add_log(state, "⏸ Bot is paused — skipping scan")
+        save_state(state)
+        return
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
     if state.get("signals_date") != today:
@@ -643,6 +759,10 @@ def scan_once():
         if not API_KEY or not API_SECRET:
             add_error(state, "API keys not configured — set BINANCE_FUTURES_API_KEY and BINANCE_FUTURES_SECRET")
 
+    # Update pending orders count from Binance
+    pending_count = get_all_open_orders_count()
+    state["pending_orders_count"] = pending_count
+
     add_log(state, f"🔍 Scanning {len(WATCH_LIST)} coins | Balance: ${state['balance']:.2f}")
     state["bot_status"] = "scanning"
     state["last_scan"]  = datetime.utcnow().strftime("%H:%M:%S")
@@ -653,12 +773,6 @@ def scan_once():
     for coin in WATCH_LIST:
         if len(state["open_trades"]) >= MAX_OPEN_TRADES: break
         if state.get("signals_today", 0) >= MAX_SIGNALS_DAY: break
-
-        # Skip if already have 2 trades on this coin
-        existing = [t for t in state["open_trades"] if t["symbol"] == coin]
-        if len(existing) >= 2:
-            scan_results.append(f"{coin}:open×{len(existing)}")
-            continue
 
         htf_trend, htf_strength = get_htf_trend(coin)
 
@@ -700,10 +814,54 @@ def scan_once():
                 scan_results.append(f"{coin}:{direction}_rr{rr:.1f}_fail")
                 continue
 
-            # Allocation
-            alloc_pct = SCORE_ALLOC_PCT.get(min(score, 11), 2.0)
+            # ── DUPLICATE SIGNAL CHECK ──
             with _lock:
                 state = load_state()
+
+            existing_same = [
+                t for t in state["open_trades"]
+                if t["symbol"] == coin and t["direction"] == direction
+            ]
+
+            if existing_same:
+                # Same coin, same direction already open
+                old_trade = existing_same[0]
+                old_score = old_trade.get("score", 0)
+
+                if score > old_score + 2:
+                    # New score is significantly better (>2 points) — update SL/TP
+                    info = get_exchange_info(coin)
+                    if info:
+                        new_sl_id, new_tp_id = update_sl_tp_orders(old_trade, sl, tp1, info)
+                        with _lock:
+                            state = load_state()
+                            for t in state["open_trades"]:
+                                if t["id"] == old_trade["id"]:
+                                    t["sl"]          = round(sl, 6)
+                                    t["tp1"]         = round(tp1, 6)
+                                    t["tp2"]         = round(tp2, 6)
+                                    t["sl_pct"]      = round(sl_pct, 3)
+                                    t["tp1_pct"]     = round(tp1_pct, 3)
+                                    t["rr"]          = round(rr, 2)
+                                    t["score"]       = score
+                                    t["reasons"]     = reasons[:6]
+                                    t["sl_order_id"] = new_sl_id
+                                    t["tp_order_id"] = new_tp_id
+                                    break
+                            add_log(state, f"🔄 {coin} {direction} levels updated — Score {old_score}→{score} | SL:{sl:.4f} TP:{tp1:.4f}")
+                            save_state(state)
+                        # No Telegram for signal updates — only actual trades
+                        scan_results.append(f"{coin}:{direction}_UPDATED_sc{score}")
+                    else:
+                        scan_results.append(f"{coin}:{direction}_update_info_fail")
+                else:
+                    # Score not better enough — skip, no new order
+                    scan_results.append(f"{coin}:{direction}_dup_skip_sc{score}vs{old_score}")
+                continue  # Never place a second order for same coin+direction
+
+            # ── NEW TRADE ──
+            # Allocation
+            alloc_pct = SCORE_ALLOC_PCT.get(min(score, 11), 2.0)
             alloc_usd = round(state["balance"] * (alloc_pct / 100.0), 2)
             alloc_usd = min(alloc_usd, state["balance"] * MAX_ALLOC_PCT)
             alloc_usd = round(alloc_usd, 2)
@@ -751,10 +909,11 @@ def scan_once():
                 state = load_state()
                 state["open_trades"].append(trade)
                 state["signals_today"] = state.get("signals_today", 0) + 1
-                add_log(state, f"{'📈' if direction=='LONG' else '📉'} {direction} {coin} | Score:{score} Alloc:${alloc_usd:.2f} Notional:${order_info['notional']:.0f} | ✅ Order#{order_info['order_id']}")
+                add_log(state, f"{'📈' if direction=='LONG' else '📉'} {direction} {coin} | Score:{score} Alloc:${alloc_usd:.2f} | SL:{sl:.4f} TP:{tp1:.4f} | ✅ #{order_info['order_id']}")
                 save_state(state)
 
             scan_results.append(f"{coin}:{direction}_TRADE_sc{score}")
+            # Telegram — only for actual new trades
             tg(f"{'📈' if direction=='LONG' else '📉'} *{direction} {coin}*\n"
                f"Score `{score}` | HTF `{htf_trend}` | RR `1:{rr:.1f}` | Lev `{LEVERAGE}x`\n"
                f"Entry `${entry:.4f}` | SL `${sl:.4f}`\n"
@@ -767,9 +926,8 @@ def scan_once():
 
     with _lock:
         state = load_state()
-        state["bot_status"] = "idle"
+        state["bot_status"] = "idle" if state.get("bot_running", True) else "stopped"
         add_log(state, f"✅ Scan done — {found} signals | Open:{len(state['open_trades'])}")
-        # Log scan summary in chunks
         for i in range(0, len(scan_results), 4):
             add_log(state, "📋 " + " | ".join(scan_results[i:i+4]))
         save_state(state)
@@ -782,7 +940,8 @@ def run():
     with _lock:
         state = load_state()
         add_log(state, "🚀 Bot started — Binance Futures Testnet")
-        state["bot_status"] = "running"
+        state["bot_status"]  = "running"
+        state["bot_running"] = True
         save_state(state)
 
     tg("🚀 *Futures Bot Started*\n"
@@ -793,10 +952,21 @@ def run():
     scan_counter = 0
     while True:
         try:
-            monitor_open_trades()
+            # Check bot_running flag (set by dashboard)
+            with _lock:
+                state = load_state()
+            bot_running = state.get("bot_running", True)
 
-            if scan_counter % 15 == 0:
-                scan_once()
+            if bot_running:
+                monitor_open_trades()
+                if scan_counter % 15 == 0:
+                    scan_once()
+            else:
+                # Stopped — just update status
+                with _lock:
+                    state = load_state()
+                    state["bot_status"] = "stopped"
+                    save_state(state)
 
             scan_counter += 1
             time.sleep(60)
