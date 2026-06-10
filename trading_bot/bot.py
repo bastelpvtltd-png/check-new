@@ -1,5 +1,5 @@
 import time, os, json, threading, logging, hmac, hashlib
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 import pandas as pd
 import requests
@@ -17,8 +17,27 @@ API_SECRET = os.environ.get("BINANCE_FUTURES_SECRET",  "")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
-FUTURES_BASE   = "https://testnet.binancefuture.com"   # Futures testnet
-STATE_FILE     = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
+FUTURES_BASE = "https://testnet.binancefuture.com"
+STATE_FILE   = os.environ.get("STATE_FILE", "/tmp/bot_state.json")
+
+# Sri Lanka timezone (UTC+5:30)
+SL_TZ = timezone(timedelta(hours=5, minutes=30))
+
+def now_sl():
+    """Current time in Sri Lanka timezone."""
+    return datetime.now(SL_TZ)
+
+def ts_sl():
+    """Timestamp string in SL time."""
+    return now_sl().strftime("%H:%M:%S")
+
+def dt_sl():
+    """Datetime string in SL time."""
+    return now_sl().strftime("%Y-%m-%d %H:%M")
+
+def today_sl():
+    """Today's date string in SL time."""
+    return now_sl().strftime("%Y-%m-%d")
 
 WATCH_LIST = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
@@ -27,15 +46,15 @@ WATCH_LIST = [
     "OPUSDT","ARBUSDT","SUIUSDT","TIAUSDT","FETUSDT"
 ]
 
-MIN_SCORE        = 9
-MAX_SIGNALS_DAY  = 15
-MAX_OPEN_TRADES  = 15
-MIN_RR           = 1.8
-DATA_LIMIT       = 300
-LEVERAGE         = 1
-SCORE_ALLOC_PCT  = {4:2.0, 5:3.0, 6:5.0, 7:7.0, 8:9.0, 9:12.0, 10:15.0, 11:15.0}
-MAX_ALLOC_PCT    = 0.15
-MIN_TRADE_USDT   = 10.0
+MIN_SCORE       = 9
+MAX_SIGNALS_DAY = 15
+MAX_OPEN_TRADES = 15
+MIN_RR          = 1.8
+DATA_LIMIT      = 300
+LEVERAGE        = 1
+SCORE_ALLOC_PCT = {4:2.0, 5:3.0, 6:5.0, 7:7.0, 8:9.0, 9:12.0, 10:15.0, 11:15.0}
+MAX_ALLOC_PCT   = 0.15
+MIN_TRADE_USDT  = 10.0
 
 # ═══════════════════════════════════════════════
 # SESSION
@@ -67,7 +86,8 @@ def load_state():
             "wins": 0, "losses": 0, "bes": 0,
             "total_pnl": 0.0, "log": [],
             "errors": [],
-            "bot_running": True   # NEW: start/stop control
+            "bot_running": True,
+            "pending_orders_count": 0,
         }
 
 def save_state(state):
@@ -75,19 +95,17 @@ def save_state(state):
         json.dump(state, f, indent=2, default=str)
 
 def add_log(state, msg, level="INFO"):
-    ts = datetime.utcnow().strftime("%H:%M:%S")
-    state["log"].insert(0, {"ts": ts, "msg": msg, "level": level})
+    state["log"].insert(0, {"ts": ts_sl(), "msg": msg, "level": level})
     state["log"] = state["log"][:300]
     log.info(msg)
 
 def add_error(state, msg):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    state["errors"].insert(0, {"ts": ts, "msg": msg})
+    state["errors"].insert(0, {"ts": dt_sl(), "msg": msg})
     state["errors"] = state["errors"][:50]
     add_log(state, f"❗ {msg}", "ERROR")
 
 # ═══════════════════════════════════════════════
-# TELEGRAM — trade alerts only, no signal spam
+# TELEGRAM — actual trades only
 # ═══════════════════════════════════════════════
 def tg(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
@@ -138,8 +156,7 @@ def fapi_post(path, params):
     try:
         r = SESSION.post(f"{FUTURES_BASE}{path}", params=params,
                          headers=headers, timeout=12)
-        data = r.json()
-        return data
+        return r.json()
     except Exception as e:
         log.error(f"fapi POST {path} exception: {e}")
         return {"error": str(e)}
@@ -160,13 +177,11 @@ def fapi_delete(path, params):
 # WALLET & MARKET DATA
 # ═══════════════════════════════════════════════
 def get_wallet_balance():
-    """Get USDT balance from futures testnet account."""
     data = fapi_get("/fapi/v2/account", {}, signed=True)
     if data and "assets" in data:
         for a in data["assets"]:
             if a.get("asset") == "USDT":
                 return float(a.get("availableBalance", 0)), float(a.get("walletBalance", 0))
-    # fallback
     data2 = fapi_get("/fapi/v2/balance", {}, signed=True)
     if isinstance(data2, list):
         for b in data2:
@@ -174,29 +189,29 @@ def get_wallet_balance():
                 return float(b.get("availableBalance", 0)), float(b.get("balance", 0))
     return None, None
 
-def get_open_orders_count(symbol=None):
-    """Get count of pending/open orders from Binance."""
-    params = {}
-    if symbol:
-        params["symbol"] = symbol
-    data = fapi_get("/fapi/v1/openOrders", params, signed=True)
-    if isinstance(data, list):
-        return len(data)
-    return 0
+def get_binance_positions():
+    """Fetch all open positions from Binance (non-zero positionAmt)."""
+    data = fapi_get("/fapi/v2/positionRisk", {}, signed=True)
+    if not isinstance(data, list):
+        return []
+    return [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
 
-def get_all_open_orders_count():
-    """Get total pending orders count across all symbols."""
+def get_binance_open_orders():
+    """Fetch all open orders (SL/TP pending) from Binance."""
     data = fapi_get("/fapi/v1/openOrders", {}, signed=True)
     if isinstance(data, list):
-        return len(data)
-    return 0
+        return data
+    return []
+
+def get_all_open_orders_count():
+    data = fapi_get("/fapi/v1/openOrders", {}, signed=True)
+    return len(data) if isinstance(data, list) else 0
 
 def get_klines(symbol, interval="1h", limit=300):
     data = fapi_get("/fapi/v1/klines", {
         "symbol": symbol, "interval": interval, "limit": limit
     })
     if not data or isinstance(data, dict):
-        log.warning(f"klines {symbol} failed: {data}")
         return None
     df = pd.DataFrame(data, columns=[
         'Open_time','open','high','low','close','volume',
@@ -231,7 +246,6 @@ def get_htf_trend(symbol):
     return "NEUTRAL", 0
 
 def get_exchange_info(symbol):
-    """Get min qty, stepSize, tickSize for a symbol."""
     data = fapi_get("/fapi/v1/exchangeInfo")
     if not data:
         return None
@@ -254,9 +268,6 @@ def round_step(value, step):
     precision = max(0, -int(math.floor(math.log10(step))))
     return round(round(value / step) * step, precision)
 
-# ═══════════════════════════════════════════════
-# SET LEVERAGE
-# ═══════════════════════════════════════════════
 def set_leverage(symbol, leverage=LEVERAGE):
     resp = fapi_post("/fapi/v1/leverage", {
         "symbol": symbol, "leverage": leverage
@@ -265,6 +276,107 @@ def set_leverage(symbol, leverage=LEVERAGE):
         return True
     log.warning(f"set_leverage {symbol} failed: {resp}")
     return False
+
+# ═══════════════════════════════════════════════
+# SYNC STATE WITH BINANCE POSITIONS
+# Binance eke actual positions state eke sync කිරීම
+# ═══════════════════════════════════════════════
+def sync_positions_with_binance(state):
+    """
+    Binance ලා open positions state ලා open_trades සමඟ compare කරලා,
+    state ලා නෑ නම් add කරනවා. Binance ලා close වෙලා state ලා තියෙනවා
+    නම් closed_trades ට move කරනවා.
+    """
+    try:
+        binance_positions = get_binance_positions()
+        binance_symbols = set()
+
+        for pos in binance_positions:
+            sym = pos["symbol"]
+            amt = float(pos["positionAmt"])
+            direction = "LONG" if amt > 0 else "SHORT"
+            entry_price = float(pos.get("entryPrice", 0))
+            binance_symbols.add(sym)
+
+            # State ලා ඒ coin+direction trade නෑ නම් add කරනවා
+            existing = [t for t in state["open_trades"]
+                        if t["symbol"] == sym and t["direction"] == direction]
+            if not existing and entry_price > 0:
+                phantom_trade = {
+                    "id":        f"{sym}_{direction}_SYNCED_{int(time.time())}",
+                    "symbol":    sym,
+                    "direction": direction,
+                    "score":     0,
+                    "entry":     entry_price,
+                    "sl":        0.0,
+                    "tp1":       0.0,
+                    "tp2":       0.0,
+                    "sl_pct":    0.0,
+                    "tp1_pct":   0.0,
+                    "rr":        0.0,
+                    "alloc_usd": abs(amt) * entry_price,
+                    "alloc_pct": 0.0,
+                    "notional":  abs(amt) * entry_price,
+                    "qty":       abs(amt),
+                    "leverage":  LEVERAGE,
+                    "htf":       "SYNC",
+                    "reasons":   ["Synced from Binance"],
+                    "open_time": dt_sl(),
+                    "order_id":  "SYNCED",
+                    "sl_order_id": "",
+                    "tp_order_id": "",
+                    "tp1_hit":   False,
+                    "outcome":   "OPEN",
+                }
+                state["open_trades"].append(phantom_trade)
+                add_log(state, f"🔄 SYNC: Added {sym} {direction} from Binance (entry=${entry_price:.4f})")
+
+        # State ලා open නම් Binance ලා නෑ නම් → auto-closed
+        to_remove = []
+        for trade in state["open_trades"]:
+            sym       = trade["symbol"]
+            direction = trade["direction"]
+            # Check if this symbol+direction exists in binance
+            match = any(
+                p["symbol"] == sym and
+                (("LONG" if float(p["positionAmt"]) > 0 else "SHORT") == direction)
+                for p in binance_positions
+            )
+            if not match:
+                # Position Binance ලා close වෙලා
+                price = get_price(sym) or trade["entry"]
+                entry = trade["entry"]
+                alloc = trade.get("alloc_usd", 0)
+                notional = trade.get("notional", alloc)
+                if direction == "LONG":
+                    pnl_pct = (price - entry) / entry * 100 if entry > 0 else 0
+                else:
+                    pnl_pct = (entry - price) / entry * 100 if entry > 0 else 0
+                pnl_usd = round(notional * pnl_pct / 100, 2)
+
+                state["total_pnl"] = round(state.get("total_pnl", 0) + pnl_usd, 2)
+                if pnl_usd > 0:   state["wins"]   += 1
+                elif pnl_usd < 0: state["losses"] += 1
+                else:             state["bes"]     += 1
+
+                trade["outcome"]    = "AUTO_CLOSED"
+                trade["pnl_usd"]    = pnl_usd
+                trade["pnl_pct"]    = round(pnl_pct, 3)
+                trade["close_time"] = dt_sl()
+                trade["exit_price"] = price
+                state["closed_trades"].insert(0, trade)
+                state["closed_trades"] = state["closed_trades"][:500]
+                to_remove.append(trade["id"])
+                em = "✅" if pnl_usd >= 0 else "❌"
+                add_log(state, f"{em} AUTO_CLOSED {sym} {direction} | P&L: ${pnl_usd:+.2f}")
+
+        if to_remove:
+            state["open_trades"] = [t for t in state["open_trades"] if t["id"] not in to_remove]
+
+    except Exception as e:
+        add_error(state, f"sync_positions error: {e}")
+
+    return state
 
 # ═══════════════════════════════════════════════
 # INDICATORS
@@ -312,7 +424,6 @@ def compute_indicators(df):
     dx = 100 * (d['PLUS_DI'] - d['MINUS_DI']).abs() / (d['PLUS_DI'] + d['MINUS_DI'] + 1e-9)
     d['ADX'] = dx.rolling(14).mean()
 
-    # SuperTrend
     hl2 = (d['high'] + d['low']) / 2
     ub  = hl2 + 3.0 * d['ATR']
     lb  = hl2 - 3.0 * d['ATR']
@@ -337,7 +448,6 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
     prev = df.iloc[i - 1]
     score = 0; reasons = []
 
-    # HTF alignment
     if direction == "LONG" and htf_trend == "BULL":
         score += htf_strength; reasons.append(f"HTF BULL +{htf_strength}")
     elif direction == "SHORT" and htf_trend == "BEAR":
@@ -347,14 +457,12 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
     else:
         return 0, ["HTF counter-trend"]
 
-    # ADX
     adx = float(c.get('ADX', 0) or 0)
     if adx < 18: return 0, [f"ADX {adx:.1f} flat"]
     if adx >= 35:   score += 3; reasons.append(f"ADX {adx:.1f} strong")
     elif adx >= 25: score += 2; reasons.append(f"ADX {adx:.1f} ok")
     else:           score += 1; reasons.append(f"ADX {adx:.1f}")
 
-    # SuperTrend — soft
     st = int(c.get('ST_DIR', 0) or 0)
     if direction == "LONG":
         if st == 1:  score += 2; reasons.append("ST bull ✓")
@@ -363,7 +471,6 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         if st == -1: score += 2; reasons.append("ST bear ✓")
         else:        score -= 1; reasons.append("ST bull ⚠")
 
-    # EMA stack
     cl   = float(c['close']); prev_cl = float(prev['close'])
     e8   = float(c['EMA8']);  e21 = float(c['EMA21'])
     e55  = float(c['EMA55']); e200 = float(c['EMA200'])
@@ -380,7 +487,6 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         elif cl < e21:                     score += 1; reasons.append("Below EMA21")
         if prev_cl > e8 and cl < e8:       score += 1; reasons.append("EMA8 cross ↓")
 
-    # RSI
     rsi = float(c['RSI'])
     if direction == "LONG":
         if rsi > 80: return 0, [f"RSI {rsi:.0f} OB"]
@@ -393,7 +499,6 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         elif 60 < rsi <= 70: score += 2; reasons.append(f"RSI {rsi:.0f} OB")
         elif rsi > 70:       score += 1; reasons.append(f"RSI {rsi:.0f} deep OB")
 
-    # MACD
     macd  = float(c.get('MACD', 0) or 0); macds  = float(c.get('MACDS', 0) or 0)
     pmacd = float(prev.get('MACD', 0) or 0); pmacds = float(prev.get('MACDS', 0) or 0)
     hist  = float(c.get('MACD_HIST', 0) or 0); phist = float(prev.get('MACD_HIST', 0) or 0)
@@ -406,18 +511,15 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         elif macd < macds:                   score += 1; reasons.append("MACD bear")
         if hist < 0 and hist < phist:        score += 1; reasons.append("MACD hist ↓")
 
-    # BB squeeze filter
     bbw = float(c.get('BB_WIDTH', 0) or 0)
     if bbw < 0.012: return 0, ["BB squeeze"]
 
-    # Volume
     vm = float(c.get('VOL_MA20', 0) or 0)
     vr = c['volume'] / vm if vm > 0 else 1.0
     if vr > 2.0:   score += 3; reasons.append(f"Vol {vr:.1f}x")
     elif vr > 1.5: score += 2; reasons.append(f"Vol {vr:.1f}x")
     elif vr > 1.2: score += 1; reasons.append(f"Vol {vr:.1f}x")
 
-    # StochRSI extremes
     stoch = float(c.get('STOCHRSI', 0.5) or 0.5)
     if direction == "LONG"  and stoch > 0.92: return 0, ["StochRSI OB"]
     if direction == "SHORT" and stoch < 0.08: return 0, ["StochRSI OS"]
@@ -449,16 +551,12 @@ def calculate_levels(df, i, direction, entry):
     return sl, tp1, tp2, sl_pct, tp1_pct, rr
 
 # ═══════════════════════════════════════════════
-# PLACE FUTURES ORDER — FIXED SL/TP
+# PLACE FUTURES ORDER — FIXED (no workingType)
 # ═══════════════════════════════════════════════
 def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
-    """Place a futures market order with SL and TP on testnet."""
     state = load_state()
-
-    # Set leverage first
     set_leverage(symbol, LEVERAGE)
 
-    # Get exchange info for precision
     info = get_exchange_info(symbol)
     if not info:
         add_error(state, f"{symbol}: exchange info failed")
@@ -470,14 +568,13 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
     qty      = round_step(raw_qty, info["stepSize"])
 
     if qty * entry_price < info.get("minNotional", 5):
-        add_error(state, f"{symbol}: qty too small ({qty} @ {entry_price})")
+        add_error(state, f"{symbol}: qty too small ({qty} @ {entry_price:.4f})")
         save_state(state)
         return None, "qty_too_small"
 
-    # Determine closing side
     close_side = "SELL" if side == "BUY" else "BUY"
 
-    # ── 1. Market entry order ──
+    # ── 1. Market entry ──
     entry_resp = fapi_post("/fapi/v1/order", {
         "symbol":       symbol,
         "side":         side,
@@ -485,21 +582,22 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
         "quantity":     qty,
         "positionSide": "BOTH",
     })
-
     if not isinstance(entry_resp, dict) or "orderId" not in entry_resp:
         err = str(entry_resp)
-        add_error(state, f"{symbol} entry order failed: {err}")
+        add_error(state, f"{symbol} entry failed: {err}")
         save_state(state)
         tg_error(f"{symbol} entry failed: {err[:200]}")
         return None, err
 
     order_id = str(entry_resp["orderId"])
-    log.info(f"Entry order placed: {symbol} {side} qty={qty} orderId={order_id}")
-    time.sleep(0.3)  # small wait so position registers before SL/TP
+    log.info(f"Entry: {symbol} {side} qty={qty} id={order_id}")
+    time.sleep(0.5)  # wait for position to register
 
-    # ── 2. Stop-Loss order (STOP_MARKET) ──
-    sl_price = round_step(sl, info["tickSize"])
-    sl_params = {
+    sl_price = round_step(sl,  info["tickSize"])
+    tp_price = round_step(tp1, info["tickSize"])
+
+    # ── 2. Stop-Loss (STOP_MARKET, no workingType) ──
+    sl_resp = fapi_post("/fapi/v1/order", {
         "symbol":        symbol,
         "side":          close_side,
         "type":          "STOP_MARKET",
@@ -507,23 +605,19 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
         "closePosition": "true",
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
-        "workingType":   "MARK_PRICE",   # use mark price to avoid false triggers
-    }
-    sl_resp = fapi_post("/fapi/v1/order", sl_params)
+    })
     sl_order_id = ""
     if isinstance(sl_resp, dict) and "orderId" in sl_resp:
         sl_order_id = str(sl_resp["orderId"])
-        log.info(f"SL order placed: {symbol} stopPrice={sl_price} orderId={sl_order_id}")
+        log.info(f"SL placed: {symbol} @ {sl_price} id={sl_order_id}")
     else:
-        log.warning(f"SL order failed for {symbol}: {sl_resp}")
-        add_error(state, f"{symbol} SL order failed: {sl_resp}")
+        add_error(state, f"{symbol} SL failed: {sl_resp}")
         save_state(state)
 
-    time.sleep(0.2)
+    time.sleep(0.3)
 
-    # ── 3. Take-Profit order (TAKE_PROFIT_MARKET) ──
-    tp_price = round_step(tp1, info["tickSize"])
-    tp_params = {
+    # ── 3. Take-Profit (TAKE_PROFIT_MARKET, no workingType) ──
+    tp_resp = fapi_post("/fapi/v1/order", {
         "symbol":        symbol,
         "side":          close_side,
         "type":          "TAKE_PROFIT_MARKET",
@@ -531,16 +625,13 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1):
         "closePosition": "true",
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
-        "workingType":   "MARK_PRICE",   # use mark price
-    }
-    tp_resp = fapi_post("/fapi/v1/order", tp_params)
+    })
     tp_order_id = ""
     if isinstance(tp_resp, dict) and "orderId" in tp_resp:
         tp_order_id = str(tp_resp["orderId"])
-        log.info(f"TP order placed: {symbol} stopPrice={tp_price} orderId={tp_order_id}")
+        log.info(f"TP placed: {symbol} @ {tp_price} id={tp_order_id}")
     else:
-        log.warning(f"TP order failed for {symbol}: {tp_resp}")
-        add_error(state, f"{symbol} TP order failed: {tp_resp}")
+        add_error(state, f"{symbol} TP failed: {tp_resp}")
         save_state(state)
 
     return {
@@ -556,20 +647,19 @@ def cancel_orders(symbol, order_ids):
         if not oid:
             continue
         resp = fapi_delete("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
-        log.info(f"Cancelled order {oid} on {symbol}: {resp}")
+        log.info(f"Cancelled {oid} on {symbol}: {resp}")
 
 def update_sl_tp_orders(trade, new_sl, new_tp1, info):
-    """Cancel old SL/TP and place new ones with updated levels."""
-    symbol = trade["symbol"]
-    side   = trade["direction"]
-    close_side = "SELL" if side == "LONG" else "BUY"
+    symbol     = trade["symbol"]
+    direction  = trade["direction"]
+    close_side = "SELL" if direction == "LONG" else "BUY"
 
-    # Cancel existing SL and TP
     cancel_orders(symbol, [trade.get("sl_order_id"), trade.get("tp_order_id")])
     time.sleep(0.3)
 
-    # New SL
-    sl_price = round_step(new_sl, info["tickSize"])
+    sl_price = round_step(new_sl,  info["tickSize"])
+    tp_price = round_step(new_tp1, info["tickSize"])
+
     sl_resp = fapi_post("/fapi/v1/order", {
         "symbol":        symbol,
         "side":          close_side,
@@ -578,14 +668,11 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info):
         "closePosition": "true",
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
-        "workingType":   "MARK_PRICE",
     })
-    new_sl_id = str(sl_resp.get("orderId", "")) if isinstance(sl_resp, dict) else ""
+    new_sl_id = str(sl_resp.get("orderId", "")) if isinstance(sl_resp, dict) and "orderId" in sl_resp else ""
 
     time.sleep(0.2)
 
-    # New TP
-    tp_price = round_step(new_tp1, info["tickSize"])
     tp_resp = fapi_post("/fapi/v1/order", {
         "symbol":        symbol,
         "side":          close_side,
@@ -594,33 +681,45 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info):
         "closePosition": "true",
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
-        "workingType":   "MARK_PRICE",
     })
-    new_tp_id = str(tp_resp.get("orderId", "")) if isinstance(tp_resp, dict) else ""
+    new_tp_id = str(tp_resp.get("orderId", "")) if isinstance(tp_resp, dict) and "orderId" in tp_resp else ""
 
     return new_sl_id, new_tp_id
 
+# ═══════════════════════════════════════════════
+# MANUAL CLOSE (from dashboard)
+# ═══════════════════════════════════════════════
 def close_trade_market(trade):
-    """Force close a trade with a market order (for dashboard close button)."""
+    """Market close — cancel SL/TP first, then close position."""
     symbol    = trade["symbol"]
     direction = trade["direction"]
     qty       = trade.get("qty", 0)
     close_side = "SELL" if direction == "LONG" else "BUY"
 
-    # Cancel existing SL/TP first
+    # Cancel existing SL/TP
     cancel_orders(symbol, [trade.get("sl_order_id"), trade.get("tp_order_id")])
-    time.sleep(0.2)
+    time.sleep(0.3)
+
+    if qty <= 0:
+        # Try to get qty from Binance position
+        positions = get_binance_positions()
+        for p in positions:
+            if p["symbol"] == symbol:
+                amt = abs(float(p.get("positionAmt", 0)))
+                if amt > 0:
+                    qty = amt
+                    break
 
     if qty <= 0:
         return False, "qty_zero"
 
+    # Close with market order — use closePosition=true instead of reduceOnly
     resp = fapi_post("/fapi/v1/order", {
-        "symbol":       symbol,
-        "side":         close_side,
-        "type":         "MARKET",
-        "quantity":     qty,
-        "positionSide": "BOTH",
-        "reduceOnly":   "true",
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "MARKET",
+        "quantity":      qty,
+        "positionSide":  "BOTH",
     })
     if isinstance(resp, dict) and "orderId" in resp:
         return True, str(resp["orderId"])
@@ -632,6 +731,10 @@ def close_trade_market(trade):
 def monitor_open_trades():
     with _lock:
         state = load_state()
+
+    # Sync with Binance positions first
+    state = sync_positions_with_binance(state)
+    save_state(state)
 
     if not state["open_trades"]:
         return
@@ -649,7 +752,15 @@ def monitor_open_trades():
         tp1   = trade["tp1"]
         tp2   = trade["tp2"]
 
-        # Live P&L
+        # Skip synced trades with no SL/TP set (sl=0)
+        if sl == 0:
+            if direction == "LONG":
+                live_pct = (price - entry) / entry * 100 if entry > 0 else 0
+            else:
+                live_pct = (entry - price) / entry * 100 if entry > 0 else 0
+            log.info(f"MONITOR {sym} {direction} (SYNCED) price={price:.4f} pnl={live_pct:+.2f}%")
+            continue
+
         if direction == "LONG":
             live_pct = (price - entry) / entry * 100
         else:
@@ -682,27 +793,23 @@ def monitor_open_trades():
         if outcome:
             alloc    = trade["alloc_usd"]
             notional = trade.get("notional", alloc * LEVERAGE)
-            if outcome == "TP2_HIT":
-                pnl_usd = notional * abs(pnl_pct) / 100
-            elif outcome == "SL_HIT":
-                pnl_usd = -notional * abs(pnl_pct) / 100
-            else:
-                pnl_usd = notional * abs(pnl_pct) / 100
+            pnl_usd  = notional * abs(pnl_pct) / 100
+            if outcome == "SL_HIT":
+                pnl_usd = -pnl_usd
 
-            # Cancel remaining orders on exchange
             cancel_orders(sym, [trade.get("sl_order_id"), trade.get("tp_order_id")])
 
             with _lock:
                 state = load_state()
                 state["total_pnl"] = round(state.get("total_pnl", 0) + pnl_usd, 2)
-                if outcome == "TP2_HIT": state["wins"]   += 1
-                elif outcome == "BREAKEVEN": state["bes"] += 1
-                else: state["losses"] += 1
+                if outcome == "TP2_HIT":   state["wins"]   += 1
+                elif outcome == "BREAKEVEN": state["bes"]  += 1
+                else:                        state["losses"] += 1
 
                 trade["outcome"]    = outcome
                 trade["pnl_usd"]    = round(pnl_usd, 2)
                 trade["pnl_pct"]    = round(pnl_pct, 3)
-                trade["close_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+                trade["close_time"] = dt_sl()
                 trade["exit_price"] = price
                 state["closed_trades"].insert(0, trade)
                 state["closed_trades"] = state["closed_trades"][:500]
@@ -724,19 +831,17 @@ def monitor_open_trades():
             save_state(state)
 
 # ═══════════════════════════════════════════════
-# MAIN SCAN — with duplicate signal logic
+# MAIN SCAN
 # ═══════════════════════════════════════════════
 def scan_once():
     with _lock:
         state = load_state()
 
-    # If bot is stopped via dashboard, skip scan
     if not state.get("bot_running", True):
-        add_log(state, "⏸ Bot is paused — skipping scan")
-        save_state(state)
-        return
+        add_log(state, "⏸ Bot paused — skip scan")
+        save_state(state); return
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = today_sl()
     if state.get("signals_date") != today:
         state["signals_today"] = 0
         state["signals_date"]  = today
@@ -749,23 +854,17 @@ def scan_once():
         add_log(state, f"📊 Daily limit {MAX_SIGNALS_DAY} reached")
         save_state(state); return
 
-    # Refresh wallet balance
     avail_bal, wallet_bal = get_wallet_balance()
     if avail_bal is not None:
         state["balance"]        = round(avail_bal, 2)
         state["wallet_balance"] = round(wallet_bal, 2)
     else:
         add_error(state, "Could not fetch wallet balance")
-        if not API_KEY or not API_SECRET:
-            add_error(state, "API keys not configured — set BINANCE_FUTURES_API_KEY and BINANCE_FUTURES_SECRET")
 
-    # Update pending orders count from Binance
-    pending_count = get_all_open_orders_count()
-    state["pending_orders_count"] = pending_count
-
+    state["pending_orders_count"] = get_all_open_orders_count()
     add_log(state, f"🔍 Scanning {len(WATCH_LIST)} coins | Balance: ${state['balance']:.2f}")
     state["bot_status"] = "scanning"
-    state["last_scan"]  = datetime.utcnow().strftime("%H:%M:%S")
+    state["last_scan"]  = ts_sl()
     save_state(state)
 
     found = 0; scan_results = []
@@ -775,29 +874,22 @@ def scan_once():
         if state.get("signals_today", 0) >= MAX_SIGNALS_DAY: break
 
         htf_trend, htf_strength = get_htf_trend(coin)
-
         df_raw = get_klines(coin, "1h", DATA_LIMIT)
         if df_raw is None:
             scan_results.append(f"{coin}:klines_fail")
-            add_log(state, f"⚠️ {coin} klines failed", "WARN")
             continue
 
         df = compute_indicators(df_raw)
         i  = len(df) - 1
         if i < 100:
-            scan_results.append(f"{coin}:data_short")
-            continue
+            scan_results.append(f"{coin}:data_short"); continue
 
         c = df.iloc[i]
         if any(pd.isna(c.get(k, float('nan'))) for k in ['ATR','EMA200','STOCHRSI','ADX']):
-            scan_results.append(f"{coin}:indicator_nan")
-            continue
+            scan_results.append(f"{coin}:indicator_nan"); continue
 
-        # Direction by HTF or ST
-        if htf_trend == "BULL":
-            directions = ["LONG"]
-        elif htf_trend == "BEAR":
-            directions = ["SHORT"]
+        if htf_trend == "BULL":       directions = ["LONG"]
+        elif htf_trend == "BEAR":     directions = ["SHORT"]
         else:
             st_now = int(c.get('ST_DIR', 1) or 1)
             directions = ["LONG"] if st_now == 1 else ["SHORT"]
@@ -805,31 +897,23 @@ def scan_once():
         for direction in directions:
             score, reasons = score_signal(df, i, direction, htf_trend, htf_strength)
             if score < MIN_SCORE:
-                scan_results.append(f"{coin}:{direction}_sc{score}")
-                continue
+                scan_results.append(f"{coin}:{direction}_sc{score}"); continue
 
             entry = float(c['close'])
             sl, tp1, tp2, sl_pct, tp1_pct, rr = calculate_levels(df, i, direction, entry)
             if rr < MIN_RR:
-                scan_results.append(f"{coin}:{direction}_rr{rr:.1f}_fail")
-                continue
+                scan_results.append(f"{coin}:{direction}_rr{rr:.1f}"); continue
 
-            # ── DUPLICATE SIGNAL CHECK ──
             with _lock:
                 state = load_state()
 
-            existing_same = [
-                t for t in state["open_trades"]
-                if t["symbol"] == coin and t["direction"] == direction
-            ]
-
+            # ── Duplicate signal check ──
+            existing_same = [t for t in state["open_trades"]
+                             if t["symbol"] == coin and t["direction"] == direction]
             if existing_same:
-                # Same coin, same direction already open
                 old_trade = existing_same[0]
                 old_score = old_trade.get("score", 0)
-
                 if score > old_score + 2:
-                    # New score is significantly better (>2 points) — update SL/TP
                     info = get_exchange_info(coin)
                     if info:
                         new_sl_id, new_tp_id = update_sl_tp_orders(old_trade, sl, tp1, info)
@@ -837,46 +921,31 @@ def scan_once():
                             state = load_state()
                             for t in state["open_trades"]:
                                 if t["id"] == old_trade["id"]:
-                                    t["sl"]          = round(sl, 6)
-                                    t["tp1"]         = round(tp1, 6)
-                                    t["tp2"]         = round(tp2, 6)
-                                    t["sl_pct"]      = round(sl_pct, 3)
-                                    t["tp1_pct"]     = round(tp1_pct, 3)
-                                    t["rr"]          = round(rr, 2)
-                                    t["score"]       = score
-                                    t["reasons"]     = reasons[:6]
-                                    t["sl_order_id"] = new_sl_id
-                                    t["tp_order_id"] = new_tp_id
+                                    t["sl"] = round(sl, 6); t["tp1"] = round(tp1, 6)
+                                    t["tp2"] = round(tp2, 6); t["score"] = score
+                                    t["sl_order_id"] = new_sl_id; t["tp_order_id"] = new_tp_id
+                                    t["reasons"] = reasons[:6]
                                     break
-                            add_log(state, f"🔄 {coin} {direction} levels updated — Score {old_score}→{score} | SL:{sl:.4f} TP:{tp1:.4f}")
+                            add_log(state, f"🔄 {coin} {direction} updated score {old_score}→{score}")
                             save_state(state)
-                        # No Telegram for signal updates — only actual trades
-                        scan_results.append(f"{coin}:{direction}_UPDATED_sc{score}")
-                    else:
-                        scan_results.append(f"{coin}:{direction}_update_info_fail")
+                    scan_results.append(f"{coin}:{direction}_UPDATED")
                 else:
-                    # Score not better enough — skip, no new order
-                    scan_results.append(f"{coin}:{direction}_dup_skip_sc{score}vs{old_score}")
-                continue  # Never place a second order for same coin+direction
+                    scan_results.append(f"{coin}:{direction}_dup_skip")
+                continue
 
-            # ── NEW TRADE ──
-            # Allocation
+            # ── New trade ──
             alloc_pct = SCORE_ALLOC_PCT.get(min(score, 11), 2.0)
             alloc_usd = round(state["balance"] * (alloc_pct / 100.0), 2)
             alloc_usd = min(alloc_usd, state["balance"] * MAX_ALLOC_PCT)
             alloc_usd = round(alloc_usd, 2)
 
             if alloc_usd < MIN_TRADE_USDT:
-                scan_results.append(f"{coin}:alloc_low${alloc_usd:.0f}")
-                continue
+                scan_results.append(f"{coin}:alloc_low${alloc_usd:.0f}"); continue
 
-            # Place order
             side = "BUY" if direction == "LONG" else "SELL"
             order_info, status = place_futures_order(coin, side, alloc_usd, entry, sl, tp1)
-
             if order_info is None:
-                scan_results.append(f"{coin}:order_fail_{status[:20]}")
-                continue
+                scan_results.append(f"{coin}:order_fail_{status[:20]}"); continue
 
             trade = {
                 "id":          f"{coin}_{direction}_{int(time.time())}",
@@ -897,7 +966,7 @@ def scan_once():
                 "leverage":    LEVERAGE,
                 "htf":         htf_trend,
                 "reasons":     reasons[:6],
-                "open_time":   datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+                "open_time":   dt_sl(),
                 "order_id":    order_info["order_id"],
                 "sl_order_id": order_info["sl_order_id"],
                 "tp_order_id": order_info["tp_order_id"],
@@ -913,7 +982,6 @@ def scan_once():
                 save_state(state)
 
             scan_results.append(f"{coin}:{direction}_TRADE_sc{score}")
-            # Telegram — only for actual new trades
             tg(f"{'📈' if direction=='LONG' else '📉'} *{direction} {coin}*\n"
                f"Score `{score}` | HTF `{htf_trend}` | RR `1:{rr:.1f}` | Lev `{LEVERAGE}x`\n"
                f"Entry `${entry:.4f}` | SL `${sl:.4f}`\n"
@@ -952,7 +1020,6 @@ def run():
     scan_counter = 0
     while True:
         try:
-            # Check bot_running flag (set by dashboard)
             with _lock:
                 state = load_state()
             bot_running = state.get("bot_running", True)
@@ -962,7 +1029,6 @@ def run():
                 if scan_counter % 15 == 0:
                     scan_once()
             else:
-                # Stopped — just update status
                 with _lock:
                     state = load_state()
                     state["bot_status"] = "stopped"
