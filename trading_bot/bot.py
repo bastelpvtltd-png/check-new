@@ -161,17 +161,31 @@ def fapi_post(path, params):
         log.error(f"fapi POST {path} exception: {e}")
         return {"error": str(e)}
 
-def fapi_post_algo(path, params):
-    """POST to Binance Algo Order API endpoint (required for STOP_MARKET / TAKE_PROFIT_MARKET)."""
+def fapi_post_algo(params):
+    """POST /fapi/v1/algoOrder — required for STOP/TAKE_PROFIT conditional orders since 2025-12-09."""
+    params["algoType"] = "CONDITIONAL"
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign(params)
     headers = {"X-MBX-APIKEY": API_KEY}
     try:
-        r = SESSION.post(f"{FUTURES_BASE}{path}", params=params,
+        r = SESSION.post(f"{FUTURES_BASE}/fapi/v1/algoOrder", params=params,
                          headers=headers, timeout=12)
         return r.json()
     except Exception as e:
-        log.error(f"fapi ALGO POST {path} exception: {e}")
+        log.error(f"fapi ALGO POST exception: {e}")
+        return {"error": str(e)}
+
+def fapi_delete_algo(algo_id):
+    """DELETE /fapi/v1/algoOrder — cancel a conditional order by algoId."""
+    params = {"algoId": algo_id, "timestamp": int(time.time() * 1000)}
+    params["signature"] = sign(params)
+    headers = {"X-MBX-APIKEY": API_KEY}
+    try:
+        r = SESSION.delete(f"{FUTURES_BASE}/fapi/v1/algoOrder", params=params,
+                           headers=headers, timeout=12)
+        return r.json()
+    except Exception as e:
+        log.error(f"fapi ALGO DELETE exception: {e}")
         return {"error": str(e)}
 
 def fapi_delete(path, params):
@@ -340,7 +354,7 @@ def sync_positions_with_binance(state):
                             half_qty  = qty  # full qty for closePosition orders
 
                             # SL — algo endpoint
-                            sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
+                            sl_resp = fapi_post_algo({
                                 "symbol":        sym,
                                 "side":          close_side,
                                 "type":          "STOP",
@@ -349,15 +363,15 @@ def sync_positions_with_binance(state):
                                 "positionSide":  "BOTH",
                                 "timeInForce":   "GTC",
                             })
-                            if isinstance(sl_resp, dict) and "orderId" in sl_resp:
-                                sl_order_id = str(sl_resp["orderId"])
+                            if isinstance(sl_resp, dict) and "algoId" in sl_resp:
+                                sl_order_id = str(sl_resp["algoId"])
                                 add_log(state, f"✅ SYNC SL placed {sym} @ {sl_price}")
                             else:
                                 add_error(state, f"SYNC SL failed {sym}: {sl_resp}")
                             time.sleep(0.3)
 
                             # TP1 — algo endpoint (no reduceOnly on testnet)
-                            tp1_resp = fapi_post_algo("/fapi/v1/order/algo", {
+                            tp1_resp = fapi_post_algo({
                                 "symbol":        sym,
                                 "side":          close_side,
                                 "type":          "TAKE_PROFIT",
@@ -366,8 +380,8 @@ def sync_positions_with_binance(state):
                                 "positionSide":  "BOTH",
                                 "timeInForce":   "GTC",
                             })
-                            if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
-                                tp1_order_id = str(tp1_resp["orderId"])
+                            if isinstance(tp1_resp, dict) and "algoId" in tp1_resp:
+                                tp1_order_id = str(tp1_resp["algoId"])
                                 add_log(state, f"✅ SYNC TP1 placed {sym} @ {tp1_price}")
                             else:
                                 add_error(state, f"SYNC TP1 failed {sym}: {tp1_resp}")
@@ -679,7 +693,7 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     tp1_price = round_step(tp1, info["tickSize"])
 
     # ── 2. Stop-Loss → algo endpoint (STOP_MARKET requires /fapi/v1/order/algo) ──
-    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
+    sl_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
         "type":          "STOP",
@@ -689,8 +703,8 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
         "timeInForce":   "GTC",
     })
     sl_order_id = ""
-    if isinstance(sl_resp, dict) and "orderId" in sl_resp:
-        sl_order_id = str(sl_resp["orderId"])
+    if isinstance(sl_resp, dict) and "algoId" in sl_resp:
+        sl_order_id = str(sl_resp["algoId"])
         log.info(f"SL placed: {symbol} @ {sl_price} id={sl_order_id}")
     else:
         add_error(state, f"{symbol} SL failed: {sl_resp}")
@@ -702,7 +716,7 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     #    TP2 is tracked by bot monitor in software — when price reaches tp2
     #    after tp1 would have closed, the bot records it as TP2_HIT via AUTO_CLOSED.
     #    If you want split TP, enable OCO/bracket orders on live (not testnet).
-    tp1_resp = fapi_post_algo("/fapi/v1/order/algo", {
+    tp1_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
         "type":          "TAKE_PROFIT",
@@ -712,8 +726,8 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
         "timeInForce":   "GTC",
     })
     tp1_order_id = ""
-    if isinstance(tp1_resp, dict) and "orderId" in tp1_resp:
-        tp1_order_id = str(tp1_resp["orderId"])
+    if isinstance(tp1_resp, dict) and "algoId" in tp1_resp:
+        tp1_order_id = str(tp1_resp["algoId"])
         log.info(f"TP1 placed: {symbol} @ {tp1_price} id={tp1_order_id}")
     else:
         add_error(state, f"{symbol} TP1 failed: {tp1_resp}")
@@ -730,11 +744,18 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     }, "ok"
 
 def cancel_orders(symbol, order_ids):
+    """Cancel a list of order IDs. SL/TP orders are algo orders (algoId); use fapi_delete_algo for them."""
     for oid in order_ids:
         if not oid:
             continue
-        resp = fapi_delete("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
-        log.info(f"Cancelled {oid} on {symbol}: {resp}")
+        # Algo orders (SL/TP) are cancelled via DELETE /fapi/v1/algoOrder with algoId.
+        # Regular orders (entry/close) are cancelled via DELETE /fapi/v1/order with orderId.
+        # Since 2025-12-09 all SL/TP IDs stored are algoIds — always use algo cancel.
+        resp = fapi_delete_algo(oid)
+        if isinstance(resp, dict) and resp.get("code") not in (None, "200", 200):
+            # Fallback: try regular order cancel (for any legacy orderId still in state)
+            fapi_delete("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
+        log.info(f"Cancelled algo order {oid} on {symbol}: {resp}")
 
 def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
     symbol     = trade["symbol"]
@@ -752,7 +773,7 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
     sl_price  = round_step(new_sl,  info["tickSize"])
     tp1_price = round_step(new_tp1, info["tickSize"])
 
-    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
+    sl_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
         "type":          "STOP",
@@ -761,12 +782,12 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
     })
-    new_sl_id = str(sl_resp.get("orderId", "")) if isinstance(sl_resp, dict) and "orderId" in sl_resp else ""
+    new_sl_id = str(sl_resp.get("algoId", "")) if isinstance(sl_resp, dict) and "algoId" in sl_resp else ""
 
     time.sleep(0.2)
 
     # TP1 — algo endpoint (no reduceOnly on testnet)
-    tp1_resp = fapi_post_algo("/fapi/v1/order/algo", {
+    tp1_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
         "type":          "TAKE_PROFIT",
@@ -775,7 +796,7 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
     })
-    new_tp1_id = str(tp1_resp.get("orderId", "")) if isinstance(tp1_resp, dict) and "orderId" in tp1_resp else ""
+    new_tp1_id = str(tp1_resp.get("algoId", "")) if isinstance(tp1_resp, dict) and "algoId" in tp1_resp else ""
 
     return new_sl_id, new_tp1_id, ""  # tp2 = software monitor only
 
@@ -879,7 +900,7 @@ def monitor_open_trades():
                         ])
                         time.sleep(0.3)
 
-                        sl_r = fapi_post_algo("/fapi/v1/order/algo", {
+                        sl_r = fapi_post_algo({
                             "symbol":        sym,
                             "side":          close_side,
                             "type":          "STOP",
@@ -888,11 +909,11 @@ def monitor_open_trades():
                             "positionSide":  "BOTH",
                             "timeInForce":   "GTC",
                         })
-                        new_sl_id = str(sl_r["orderId"]) if isinstance(sl_r, dict) and "orderId" in sl_r else ""
+                        new_sl_id = str(sl_r["algoId"]) if isinstance(sl_r, dict) and "algoId" in sl_r else ""
                         time.sleep(0.3)
 
                         # TP1 — algo endpoint (no reduceOnly on testnet)
-                        tp1_r = fapi_post_algo("/fapi/v1/order/algo", {
+                        tp1_r = fapi_post_algo({
                             "symbol":        sym,
                             "side":          close_side,
                             "type":          "TAKE_PROFIT",
@@ -901,7 +922,7 @@ def monitor_open_trades():
                             "positionSide":  "BOTH",
                             "timeInForce":   "GTC",
                         })
-                        new_tp1_id = str(tp1_r["orderId"]) if isinstance(tp1_r, dict) and "orderId" in tp1_r else ""
+                        new_tp1_id = str(tp1_r["algoId"]) if isinstance(tp1_r, dict) and "algoId" in tp1_r else ""
                         new_tp2_id = ""  # TP2 = software monitor only
 
                         # Update trade state
@@ -944,7 +965,7 @@ def monitor_open_trades():
                     cancel_orders(sym, [trade.get("sl_order_id")])
                     time.sleep(0.2)
                     be_price = round_step(entry, info["tickSize"])
-                    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
+                    sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "SELL",
                         "type":          "STOP",
@@ -953,8 +974,8 @@ def monitor_open_trades():
                         "positionSide":  "BOTH",
                         "timeInForce":   "GTC",
                     })
-                    if isinstance(sl_resp, dict) and "orderId" in sl_resp:
-                        trade["sl_order_id"] = str(sl_resp["orderId"])
+                    if isinstance(sl_resp, dict) and "algoId" in sl_resp:
+                        trade["sl_order_id"] = str(sl_resp["algoId"])
                         trade["sl"] = entry
                 tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}` — SL moved to breakeven `${entry:.4f}`")
             if trade.get("tp1_hit") and price >= tp2:
@@ -972,7 +993,7 @@ def monitor_open_trades():
                     cancel_orders(sym, [trade.get("sl_order_id")])
                     time.sleep(0.2)
                     be_price = round_step(entry, info["tickSize"])
-                    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
+                    sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "BUY",
                         "type":          "STOP",
@@ -981,8 +1002,8 @@ def monitor_open_trades():
                         "positionSide":  "BOTH",
                         "timeInForce":   "GTC",
                     })
-                    if isinstance(sl_resp, dict) and "orderId" in sl_resp:
-                        trade["sl_order_id"] = str(sl_resp["orderId"])
+                    if isinstance(sl_resp, dict) and "algoId" in sl_resp:
+                        trade["sl_order_id"] = str(sl_resp["algoId"])
                         trade["sl"] = entry
                 tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}` — SL moved to breakeven `${entry:.4f}`")
             if trade.get("tp1_hit") and price <= tp2:
