@@ -357,7 +357,7 @@ def sync_positions_with_binance(state):
                             sl_resp = fapi_post_algo({
                                 "symbol":        sym,
                                 "side":          close_side,
-                                "type":          "STOP",
+                                "type":          "STOP_MARKET",
                                 "stopPrice":     sl_price,
                                 "closePosition": "true",
                                 "positionSide":  "BOTH",
@@ -374,7 +374,7 @@ def sync_positions_with_binance(state):
                             tp1_resp = fapi_post_algo({
                                 "symbol":        sym,
                                 "side":          close_side,
-                                "type":          "TAKE_PROFIT",
+                                "type":          "TAKE_PROFIT_MARKET",
                                 "stopPrice":     tp1_price,
                                 "closePosition": "true",
                                 "positionSide":  "BOTH",
@@ -696,7 +696,7 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     sl_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "STOP",
+        "type":          "STOP_MARKET",
         "stopPrice":     sl_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -719,7 +719,7 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     tp1_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "TAKE_PROFIT",
+        "type":          "TAKE_PROFIT_MARKET",
         "stopPrice":     tp1_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -776,7 +776,7 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
     sl_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "STOP",
+        "type":          "STOP_MARKET",
         "stopPrice":     sl_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -790,7 +790,7 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
     tp1_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "TAKE_PROFIT",
+        "type":          "TAKE_PROFIT_MARKET",
         "stopPrice":     tp1_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -903,7 +903,7 @@ def monitor_open_trades():
                         sl_r = fapi_post_algo({
                             "symbol":        sym,
                             "side":          close_side,
-                            "type":          "STOP",
+                            "type":          "STOP_MARKET",
                             "stopPrice":     round_step(new_sl, info["tickSize"]),
                             "closePosition": "true",
                             "positionSide":  "BOTH",
@@ -916,7 +916,7 @@ def monitor_open_trades():
                         tp1_r = fapi_post_algo({
                             "symbol":        sym,
                             "side":          close_side,
-                            "type":          "TAKE_PROFIT",
+                            "type":          "TAKE_PROFIT_MARKET",
                             "stopPrice":     round_step(new_tp1, info["tickSize"]),
                             "closePosition": "true",
                             "positionSide":  "BOTH",
@@ -968,7 +968,7 @@ def monitor_open_trades():
                     sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "SELL",
-                        "type":          "STOP",
+                        "type":          "STOP_MARKET",
                         "stopPrice":     be_price,
                         "closePosition": "true",
                         "positionSide":  "BOTH",
@@ -996,7 +996,7 @@ def monitor_open_trades():
                     sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "BUY",
-                        "type":          "STOP",
+                        "type":          "STOP_MARKET",
                         "stopPrice":     be_price,
                         "closePosition": "true",
                         "positionSide":  "BOTH",
