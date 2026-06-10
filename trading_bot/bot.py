@@ -161,6 +161,19 @@ def fapi_post(path, params):
         log.error(f"fapi POST {path} exception: {e}")
         return {"error": str(e)}
 
+def fapi_post_algo(path, params):
+    """POST to Binance Algo Order API endpoint (required for STOP_MARKET / TAKE_PROFIT_MARKET)."""
+    params["timestamp"] = int(time.time() * 1000)
+    params["signature"] = sign(params)
+    headers = {"X-MBX-APIKEY": API_KEY}
+    try:
+        r = SESSION.post(f"{FUTURES_BASE}{path}", params=params,
+                         headers=headers, timeout=12)
+        return r.json()
+    except Exception as e:
+        log.error(f"fapi ALGO POST {path} exception: {e}")
+        return {"error": str(e)}
+
 def fapi_delete(path, params):
     params["timestamp"] = int(time.time() * 1000)
     params["signature"] = sign(params)
@@ -326,11 +339,11 @@ def sync_positions_with_binance(state):
                             tp1_price = round_step(tp1_val, info["tickSize"])
                             half_qty  = qty  # full qty for closePosition orders
 
-                            # SL — closePosition=true
-                            sl_resp = fapi_post("/fapi/v1/order", {
+                            # SL — algo endpoint
+                            sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
                                 "symbol":        sym,
                                 "side":          close_side,
-                                "type":          "STOP_MARKET",
+                                "type":          "STOP",
                                 "stopPrice":     sl_price,
                                 "closePosition": "true",
                                 "positionSide":  "BOTH",
@@ -343,11 +356,11 @@ def sync_positions_with_binance(state):
                                 add_error(state, f"SYNC SL failed {sym}: {sl_resp}")
                             time.sleep(0.3)
 
-                            # TP1 — closePosition=true (no reduceOnly on testnet)
-                            tp1_resp = fapi_post("/fapi/v1/order", {
+                            # TP1 — algo endpoint (no reduceOnly on testnet)
+                            tp1_resp = fapi_post_algo("/fapi/v1/order/algo", {
                                 "symbol":        sym,
                                 "side":          close_side,
-                                "type":          "TAKE_PROFIT_MARKET",
+                                "type":          "TAKE_PROFIT",
                                 "stopPrice":     tp1_price,
                                 "closePosition": "true",
                                 "positionSide":  "BOTH",
@@ -617,8 +630,8 @@ def calculate_levels(df, i, direction, entry):
 # ═══════════════════════════════════════════════
 # ═══════════════════════════════════════════════
 # PLACE FUTURES ORDER
-# SL  → STOP_MARKET       closePosition=true  (Binance handles)
-# TP1 → TAKE_PROFIT_MARKET closePosition=true  (Binance closes full @ TP1)
+# SL  → STOP        via /fapi/v1/order/algo  closePosition=true  (Binance handles)
+# TP1 → TAKE_PROFIT via /fapi/v1/order/algo  closePosition=true  (Binance closes full @ TP1)
 # TP2 → bot monitor ලා track කරලා market close  (software level)
 # NOTE: reduceOnly testnet ලා reject කරනවා — use නොකරන්නේ
 # ═══════════════════════════════════════════════
@@ -665,11 +678,11 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     sl_price  = round_step(sl,  info["tickSize"])
     tp1_price = round_step(tp1, info["tickSize"])
 
-    # ── 2. Stop-Loss → closePosition=true ──
-    sl_resp = fapi_post("/fapi/v1/order", {
+    # ── 2. Stop-Loss → algo endpoint (STOP_MARKET requires /fapi/v1/order/algo) ──
+    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "STOP_MARKET",
+        "type":          "STOP",
         "stopPrice":     sl_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -685,14 +698,14 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
 
     time.sleep(0.3)
 
-    # ── 3. TP1 → closePosition=true (Binance closes full position @ TP1) ──
+    # ── 3. TP1 → algo endpoint (TAKE_PROFIT_MARKET requires /fapi/v1/order/algo) ──
     #    TP2 is tracked by bot monitor in software — when price reaches tp2
     #    after tp1 would have closed, the bot records it as TP2_HIT via AUTO_CLOSED.
     #    If you want split TP, enable OCO/bracket orders on live (not testnet).
-    tp1_resp = fapi_post("/fapi/v1/order", {
+    tp1_resp = fapi_post_algo("/fapi/v1/order/algo", {
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "TAKE_PROFIT_MARKET",
+        "type":          "TAKE_PROFIT",
         "stopPrice":     tp1_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -739,10 +752,10 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
     sl_price  = round_step(new_sl,  info["tickSize"])
     tp1_price = round_step(new_tp1, info["tickSize"])
 
-    sl_resp = fapi_post("/fapi/v1/order", {
+    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "STOP_MARKET",
+        "type":          "STOP",
         "stopPrice":     sl_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -752,11 +765,11 @@ def update_sl_tp_orders(trade, new_sl, new_tp1, info, new_tp2=None):
 
     time.sleep(0.2)
 
-    # TP1 — closePosition=true (no reduceOnly on testnet)
-    tp1_resp = fapi_post("/fapi/v1/order", {
+    # TP1 — algo endpoint (no reduceOnly on testnet)
+    tp1_resp = fapi_post_algo("/fapi/v1/order/algo", {
         "symbol":        symbol,
         "side":          close_side,
-        "type":          "TAKE_PROFIT_MARKET",
+        "type":          "TAKE_PROFIT",
         "stopPrice":     tp1_price,
         "closePosition": "true",
         "positionSide":  "BOTH",
@@ -866,10 +879,10 @@ def monitor_open_trades():
                         ])
                         time.sleep(0.3)
 
-                        sl_r = fapi_post("/fapi/v1/order", {
+                        sl_r = fapi_post_algo("/fapi/v1/order/algo", {
                             "symbol":        sym,
                             "side":          close_side,
-                            "type":          "STOP_MARKET",
+                            "type":          "STOP",
                             "stopPrice":     round_step(new_sl, info["tickSize"]),
                             "closePosition": "true",
                             "positionSide":  "BOTH",
@@ -878,11 +891,11 @@ def monitor_open_trades():
                         new_sl_id = str(sl_r["orderId"]) if isinstance(sl_r, dict) and "orderId" in sl_r else ""
                         time.sleep(0.3)
 
-                        # TP1 — closePosition=true (no reduceOnly on testnet)
-                        tp1_r = fapi_post("/fapi/v1/order", {
+                        # TP1 — algo endpoint (no reduceOnly on testnet)
+                        tp1_r = fapi_post_algo("/fapi/v1/order/algo", {
                             "symbol":        sym,
                             "side":          close_side,
-                            "type":          "TAKE_PROFIT_MARKET",
+                            "type":          "TAKE_PROFIT",
                             "stopPrice":     round_step(new_tp1, info["tickSize"]),
                             "closePosition": "true",
                             "positionSide":  "BOTH",
@@ -931,10 +944,10 @@ def monitor_open_trades():
                     cancel_orders(sym, [trade.get("sl_order_id")])
                     time.sleep(0.2)
                     be_price = round_step(entry, info["tickSize"])
-                    sl_resp = fapi_post("/fapi/v1/order", {
+                    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
                         "symbol":        sym,
                         "side":          "SELL",
-                        "type":          "STOP_MARKET",
+                        "type":          "STOP",
                         "stopPrice":     be_price,
                         "closePosition": "true",
                         "positionSide":  "BOTH",
@@ -959,10 +972,10 @@ def monitor_open_trades():
                     cancel_orders(sym, [trade.get("sl_order_id")])
                     time.sleep(0.2)
                     be_price = round_step(entry, info["tickSize"])
-                    sl_resp = fapi_post("/fapi/v1/order", {
+                    sl_resp = fapi_post_algo("/fapi/v1/order/algo", {
                         "symbol":        sym,
                         "side":          "BUY",
-                        "type":          "STOP_MARKET",
+                        "type":          "STOP",
                         "stopPrice":     be_price,
                         "closePosition": "true",
                         "positionSide":  "BOTH",
