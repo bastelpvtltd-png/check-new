@@ -192,7 +192,9 @@ HTML = """<!DOCTYPE html>
   <div class="stat-grid" id="sg"></div>
   <div class="panels">
     <div class="panel">
-      <div class="ph">Open Trades <span class="badge" id="oc">0</span></div>
+      <div class="ph">Open Trades <span class="badge" id="oc">0</span>
+        <button class="btn-sm btn-close" style="margin-left:auto" onclick="closeAllTrades()">✕ CLOSE ALL</button>
+      </div>
       <div class="tlist" id="ol"></div>
     </div>
     <div class="panel">
@@ -233,6 +235,28 @@ async function botControl(action){
     document.getElementById('btnStop').disabled=false;
   },1500);
   setTimeout(refresh,1000);
+}
+
+async function closeAllTrades(){
+  const state = await (await fetch('/api/state')).json();
+  const trades = state.open_trades || [];
+  if(trades.length === 0){ showNotify('No open trades','err'); return; }
+  if(!confirm(`Close ALL ${trades.length} open trades at market price?`)) return;
+  let ok=0, fail=0;
+  for(const t of trades){
+    try{
+      const r=await fetch('/api/trade/close',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({trade_id:t.id})
+      });
+      const d=await r.json();
+      if(d.ok) ok++; else fail++;
+    }catch(e){ fail++; }
+    await new Promise(res=>setTimeout(res,400));
+  }
+  showNotify(`Closed ${ok} trades${fail?', '+fail+' failed':''}`, fail?'err':'ok');
+  setTimeout(refresh,1500);
 }
 
 async function closeTrade(tradeId,sym){
@@ -310,11 +334,27 @@ function trow(t,isOpen){
   const out=isOpen?`<span style="color:var(--accent)">OPEN</span>`:t.outcome;
   const notional=t.notional?`<span class="lev"> ×${t.leverage||1}=$${t.notional.toFixed(0)}</span>`:'';
   const syncTag=isSynced?'<span class="sync-tag">SYNC</span>':'';
+  const tp1Hit=t.tp1_hit?'<span style="color:var(--green);font-size:9px">✓TP1</span>':'';
+
+  // SL/TP levels for open trades
+  let levelsHtml='';
+  if(isOpen && t.sl && t.tp1){
+    const slv=t.sl?t.sl.toFixed(4):'—';
+    const tp1v=t.tp1?t.tp1.toFixed(4):'—';
+    const tp2v=t.tp2?t.tp2.toFixed(4):'—';
+    levelsHtml=`<div style="font-size:9px;color:var(--muted);margin-top:2px">
+      <span style="color:var(--red)">SL ${slv}</span> |
+      <span style="color:var(--green)">T1 ${tp1v}</span> |
+      <span style="color:var(--accent)">T2 ${tp2v}</span>
+      ${tp1Hit}
+    </div>`;
+  }
+
   const closeBtn=isOpen
     ?`<button class="btn-sm btn-close" id="cb_${t.id}" onclick="closeTrade('${t.id}','${t.symbol}')">✕ CLOSE</button>`
     :`<span style="font-size:9px;color:var(--muted)">${(t.close_time||'').slice(11)||''}</span>`;
   return `<div class="trow ${rc}">
-    <div><div class="tcoin">${t.symbol.replace('USDT','')}${syncTag}</div><div class="treason">${rs}</div></div>
+    <div><div class="tcoin">${t.symbol.replace('USDT','')}${syncTag}</div><div class="treason">${rs}</div>${levelsHtml}</div>
     <div class="tdir ${dc}">${ar} ${d}</div>
     <div style="color:var(--accent);font-size:11px">${t.score||'—'}</div>
     <div style="font-size:11px">${pstr}${notional}</div>
@@ -434,7 +474,7 @@ def api_close_trade():
     close_side = "SELL" if direction == "LONG" else "BUY"
 
     # Step 1: Cancel SL/TP orders
-    for oid in [trade.get("sl_order_id"), trade.get("tp_order_id")]:
+    for oid in [trade.get("sl_order_id"), trade.get("tp_order_id"), trade.get("tp2_order_id")]:
         if oid:
             _bdel("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
             time.sleep(0.2)
