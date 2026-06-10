@@ -527,16 +527,109 @@ def compute_indicators(df):
             st_dir[i] = 1 if d['close'].iloc[i] >= flb else -1
             st_val[i] = flb if d['close'].iloc[i] >= flb else fub
     d['ST_DIR'] = st_dir; d['ST_VAL'] = st_val
+
+    # ── Ichimoku (9/26/52) ──
+    h9  = d['high'].rolling(9).max();  l9  = d['low'].rolling(9).min()
+    h26 = d['high'].rolling(26).max(); l26 = d['low'].rolling(26).min()
+    h52 = d['high'].rolling(52).max(); l52 = d['low'].rolling(52).min()
+    d['ICH_TENKAN']  = (h9  + l9)  / 2
+    d['ICH_KIJUN']   = (h26 + l26) / 2
+    d['ICH_SPAN_A']  = ((d['ICH_TENKAN'] + d['ICH_KIJUN']) / 2).shift(26)
+    d['ICH_SPAN_B']  = ((h52 + l52) / 2).shift(26)
+
+    # ── VWAP (session-level approximation: cumulative from start of df) ──
+    tp_vwap = (d['high'] + d['low'] + d['close']) / 3
+    d['VWAP'] = (tp_vwap * d['volume']).cumsum() / (d['volume'].cumsum() + 1e-9)
+
+    # ── Pivot-based Support / Resistance (last 20 bars swing highs/lows) ──
+    # SR_NEAR=1 means price within 0.5% of a swing level; SR_AT=1 means within 0.2%
+    swing_highs = d['high'].rolling(5, center=True).max()
+    swing_lows  = d['low'].rolling(5, center=True).min()
+    sr_near = [0] * len(d); sr_at = [0] * len(d)
+    for k in range(len(d)):
+        cl = d['close'].iloc[k]
+        lb2 = max(0, k - 20)
+        levels = list(swing_highs.iloc[lb2:k]) + list(swing_lows.iloc[lb2:k])
+        levels = [x for x in levels if not pd.isna(x)]
+        if levels:
+            dists = [abs(cl - lv) / (cl + 1e-9) for lv in levels]
+            mn = min(dists)
+            if mn <= 0.002:  sr_at[k]   = 1
+            elif mn <= 0.005: sr_near[k] = 1
+    d['SR_AT']   = sr_at
+    d['SR_NEAR'] = sr_near
+
+    # ── Candle patterns (last 2 bars) ──
+    o = d['open']; h = d['high']; l = d['low']; c2 = d['close']
+    body   = (c2 - o).abs()
+    rng    = (h - l).replace(0, 1e-9)
+    body_r = body / rng  # body-to-range ratio
+    upper_shadow = h - c2.where(c2 >= o, o)
+    lower_shadow = c2.where(c2 <= o, o) - l
+
+    # Bullish engulfing: prev bar bearish, current bar bullish and body engulfs prev
+    bull_engulf = ((c2.shift(1) < o.shift(1)) &   # prev bearish
+                   (c2 > o) &                       # current bullish
+                   (o <= c2.shift(1)) &             # current open <= prev close
+                   (c2 >= o.shift(1)))              # current close >= prev open
+    # Bearish engulfing
+    bear_engulf = ((c2.shift(1) > o.shift(1)) &
+                   (c2 < o) &
+                   (o >= c2.shift(1)) &
+                   (c2 <= o.shift(1)))
+    # Hammer (bullish): small body at top, long lower shadow ≥ 2×body
+    hammer = ((lower_shadow >= 2 * body) & (upper_shadow <= 0.3 * body) & (c2 >= o))
+    # Shooting star (bearish): small body at bottom, long upper shadow
+    shooting_star = ((upper_shadow >= 2 * body) & (lower_shadow <= 0.3 * body) & (c2 <= o))
+    # 3 white soldiers: 3 consecutive bullish candles, each closing higher
+    soldiers = (c2 > o) & (c2.shift(1) > o.shift(1)) & (c2.shift(2) > o.shift(2)) & \
+               (c2 > c2.shift(1)) & (c2.shift(1) > c2.shift(2))
+    # 3 black crows
+    crows = (c2 < o) & (c2.shift(1) < o.shift(1)) & (c2.shift(2) < o.shift(2)) & \
+            (c2 < c2.shift(1)) & (c2.shift(1) < c2.shift(2))
+    # Inside bar (IB): current bar entirely within previous bar range
+    inside_bar = (h < h.shift(1)) & (l > l.shift(1))
+
+    d['BULL_ENGULF']  = bull_engulf.astype(int)
+    d['BEAR_ENGULF']  = bear_engulf.astype(int)
+    d['HAMMER']       = hammer.astype(int)
+    d['SHOOT_STAR']   = shooting_star.astype(int)
+    d['SOLDIERS']     = soldiers.astype(int)
+    d['CROWS']        = crows.astype(int)
+    d['INSIDE_BAR']   = inside_bar.astype(int)
+
+    # ── Market structure: HH+HL (bull) / LH+LL (bear) over last 10 bars ──
+    ms_bull = [0] * len(d); ms_bear = [0] * len(d)
+    for k in range(3, len(d)):
+        lb3 = max(0, k - 10)
+        highs = list(d['high'].iloc[lb3:k+1])
+        lows  = list(d['low'].iloc[lb3:k+1])
+        if len(highs) >= 4:
+            hh = highs[-1] > highs[-2] > highs[-3]
+            hl = lows[-1]  > lows[-2]  > lows[-3]
+            lh = highs[-1] < highs[-2] < highs[-3]
+            ll = lows[-1]  < lows[-2]  < lows[-3]
+            if hh and hl: ms_bull[k] = 1
+            if lh and ll:  ms_bear[k] = 1
+    d['MS_BULL'] = ms_bull
+    d['MS_BEAR'] = ms_bear
+
     return d
 
 # ═══════════════════════════════════════════════
 # SIGNAL SCORING
 # ═══════════════════════════════════════════════
 def score_signal(df, i, direction, htf_trend, htf_strength):
+    """
+    13-category score engine — mirrors backtest_signal_flow.svg exactly.
+    Minimum to trade: 10 pts  (MIN_SCORE = 10)
+    """
     c    = df.iloc[i]
     prev = df.iloc[i - 1]
+    p2   = df.iloc[i - 2] if i >= 2 else prev
     score = 0; reasons = []
 
+    # ── 1. HTF Trend ── max 3 ──────────────────────────────────────────
     if direction == "LONG" and htf_trend == "BULL":
         score += htf_strength; reasons.append(f"HTF BULL +{htf_strength}")
     elif direction == "SHORT" and htf_trend == "BEAR":
@@ -546,12 +639,14 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
     else:
         return 0, ["HTF counter-trend"]
 
+    # ── 2. ADX ── max 3 ────────────────────────────────────────────────
     adx = float(c.get('ADX', 0) or 0)
     if adx < 18: return 0, [f"ADX {adx:.1f} flat"]
-    if adx >= 35:   score += 3; reasons.append(f"ADX {adx:.1f} strong")
+    if adx >= 30:   score += 3; reasons.append(f"ADX {adx:.1f} strong")
     elif adx >= 25: score += 2; reasons.append(f"ADX {adx:.1f} ok")
     else:           score += 1; reasons.append(f"ADX {adx:.1f}")
 
+    # ── 3. Supertrend ── max 2 (match +2, mismatch −1) ─────────────────
     st = int(c.get('ST_DIR', 0) or 0)
     if direction == "LONG":
         if st == 1:  score += 2; reasons.append("ST bull ✓")
@@ -560,37 +655,61 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         if st == -1: score += 2; reasons.append("ST bear ✓")
         else:        score -= 1; reasons.append("ST bull ⚠")
 
-    cl   = float(c['close']); prev_cl = float(prev['close'])
-    e8   = float(c['EMA8']);  e21 = float(c['EMA21'])
-    e55  = float(c['EMA55']); e200 = float(c['EMA200'])
+    # ── 4. EMA stack ── max 4 ──────────────────────────────────────────
+    cl    = float(c['close']); prev_cl = float(prev['close'])
+    e8    = float(c['EMA8']);   e21  = float(c['EMA21'])
+    e55   = float(c['EMA55']); e200 = float(c['EMA200'])
     if direction == "LONG":
         if cl > e8 > e21 > e55 > e200:   score += 4; reasons.append("EMA perfect bull")
-        elif cl > e21 > e55 > e200:        score += 3; reasons.append("EMA full bull")
-        elif cl > e21 > e55:               score += 2; reasons.append("EMA 21>55")
-        elif cl > e21:                     score += 1; reasons.append("Above EMA21")
-        if prev_cl < e8 and cl > e8:       score += 1; reasons.append("EMA8 cross ↑")
+        elif cl > e21 > e55 > e200:       score += 3; reasons.append("EMA full bull")
+        elif cl > e21 > e55:              score += 2; reasons.append("EMA 21>55")
+        elif cl > e21:                    score += 1; reasons.append("Above EMA21")
+        if prev_cl < e8 and cl > e8:      score += 1; reasons.append("EMA8 cross ↑")
     else:
         if cl < e8 < e21 < e55 < e200:   score += 4; reasons.append("EMA perfect bear")
-        elif cl < e21 < e55 < e200:        score += 3; reasons.append("EMA full bear")
-        elif cl < e21 < e55:               score += 2; reasons.append("EMA 21<55")
-        elif cl < e21:                     score += 1; reasons.append("Below EMA21")
-        if prev_cl > e8 and cl < e8:       score += 1; reasons.append("EMA8 cross ↓")
+        elif cl < e21 < e55 < e200:       score += 3; reasons.append("EMA full bear")
+        elif cl < e21 < e55:              score += 2; reasons.append("EMA 21<55")
+        elif cl < e21:                    score += 1; reasons.append("Below EMA21")
+        if prev_cl > e8 and cl < e8:      score += 1; reasons.append("EMA8 cross ↓")
 
-    rsi = float(c['RSI'])
+    # ── 5. Ichimoku ── max 2 ───────────────────────────────────────────
+    tk  = float(c.get('ICH_TENKAN', cl) or cl)
+    kj  = float(c.get('ICH_KIJUN',  cl) or cl)
+    sa  = float(c.get('ICH_SPAN_A', cl) or cl)
+    sb  = float(c.get('ICH_SPAN_B', cl) or cl)
+    ptk = float(prev.get('ICH_TENKAN', tk) or tk)
+    pkj = float(prev.get('ICH_KIJUN',  kj) or kj)
+    cloud_top = max(sa, sb); cloud_bot = min(sa, sb)
+    if direction == "LONG":
+        if ptk < pkj and tk > kj: score += 2; reasons.append("Ichi TK cross ↑")
+        if cl > cloud_top:        score += 1; reasons.append("Ichi above cloud")
+    else:
+        if ptk > pkj and tk < kj: score += 2; reasons.append("Ichi TK cross ↓")
+        if cl < cloud_bot:        score += 1; reasons.append("Ichi below cloud")
+
+    # ── 6. RSI ── max 4 ────────────────────────────────────────────────
+    rsi      = float(c['RSI'])
+    rsi_prev = float(prev.get('RSI', rsi) or rsi)
     if direction == "LONG":
         if rsi > 80: return 0, [f"RSI {rsi:.0f} OB"]
-        if 40 <= rsi <= 65:  score += 2; reasons.append(f"RSI {rsi:.0f} ideal")
-        elif 30 <= rsi < 40: score += 2; reasons.append(f"RSI {rsi:.0f} OS")
-        elif rsi < 30:       score += 1; reasons.append(f"RSI {rsi:.0f} deep OS")
+        if 40 <= rsi <= 65:   score += 2; reasons.append(f"RSI {rsi:.0f} ideal")
+        elif 30 <= rsi < 40:  score += 2; reasons.append(f"RSI {rsi:.0f} OS")
+        elif rsi < 30:        score += 1; reasons.append(f"RSI {rsi:.0f} deep OS")
+        # Bullish divergence: RSI rising while price flat/down
+        if rsi > rsi_prev and cl <= float(prev['close']) + float(prev.get('ATR', cl * 0.01) or cl * 0.01) * 0.3:
+            score += 2; reasons.append("RSI bull div")
     else:
         if rsi < 20: return 0, [f"RSI {rsi:.0f} OS"]
-        if 35 <= rsi <= 60:  score += 2; reasons.append(f"RSI {rsi:.0f} ideal")
-        elif 60 < rsi <= 70: score += 2; reasons.append(f"RSI {rsi:.0f} OB")
-        elif rsi > 70:       score += 1; reasons.append(f"RSI {rsi:.0f} deep OB")
+        if 35 <= rsi <= 60:   score += 2; reasons.append(f"RSI {rsi:.0f} ideal")
+        elif 60 < rsi <= 70:  score += 2; reasons.append(f"RSI {rsi:.0f} OB")
+        elif rsi > 70:        score += 1; reasons.append(f"RSI {rsi:.0f} deep OB")
+        if rsi < rsi_prev and cl >= float(prev['close']) - float(prev.get('ATR', cl * 0.01) or cl * 0.01) * 0.3:
+            score += 2; reasons.append("RSI bear div")
 
-    macd  = float(c.get('MACD', 0) or 0); macds  = float(c.get('MACDS', 0) or 0)
-    pmacd = float(prev.get('MACD', 0) or 0); pmacds = float(prev.get('MACDS', 0) or 0)
-    hist  = float(c.get('MACD_HIST', 0) or 0); phist = float(prev.get('MACD_HIST', 0) or 0)
+    # ── 7. MACD ── max 3 ───────────────────────────────────────────────
+    macd  = float(c.get('MACD',      0) or 0); macds  = float(c.get('MACDS',  0) or 0)
+    pmacd = float(prev.get('MACD',   0) or 0); pmacds = float(prev.get('MACDS',0) or 0)
+    hist  = float(c.get('MACD_HIST', 0) or 0); phist  = float(prev.get('MACD_HIST', 0) or 0)
     if direction == "LONG":
         if macd > macds and pmacd <= pmacds: score += 2; reasons.append("MACD cross ↑")
         elif macd > macds:                   score += 1; reasons.append("MACD bull")
@@ -600,18 +719,74 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
         elif macd < macds:                   score += 1; reasons.append("MACD bear")
         if hist < 0 and hist < phist:        score += 1; reasons.append("MACD hist ↓")
 
-    bbw = float(c.get('BB_WIDTH', 0) or 0)
+    # ── 8. Bollinger Bands ── max 3 ────────────────────────────────────
+    bb_up  = float(c.get('BB_UP',  cl) or cl)
+    bb_lo  = float(c.get('BB_LO',  cl) or cl)
+    bb_ma  = float(c.get('BB_MA',  cl) or cl)
+    bbw    = float(c.get('BB_WIDTH', 0) or 0)
     if bbw < 0.012: return 0, ["BB squeeze"]
+    if direction == "LONG":
+        if float(prev['close']) <= bb_lo and cl > bb_lo: score += 2; reasons.append("BB lower bounce")
+        elif cl < bb_ma:                                  score += 1; reasons.append("BB lower half")
+        if bbw > 0.04:                                    score += 1; reasons.append("BB expanding")
+    else:
+        if float(prev['close']) >= bb_up and cl < bb_up: score += 2; reasons.append("BB upper bounce")
+        elif cl > bb_ma:                                  score += 1; reasons.append("BB upper half")
+        if bbw > 0.04:                                    score += 1; reasons.append("BB expanding")
 
+    # ── 9. VWAP ── max 2 ───────────────────────────────────────────────
+    vwap = float(c.get('VWAP', cl) or cl)
+    gap  = abs(cl - vwap) / (vwap + 1e-9)
+    if direction == "LONG":
+        if cl > vwap:
+            score += 1; reasons.append("Above VWAP")
+            if gap > 0.005: score += 1; reasons.append("VWAP gap >0.5%")
+    else:
+        if cl < vwap:
+            score += 1; reasons.append("Below VWAP")
+            if gap > 0.005: score += 1; reasons.append("VWAP gap >0.5%")
+
+    # ── 10. Volume ── max 3 ────────────────────────────────────────────
     vm = float(c.get('VOL_MA20', 0) or 0)
     vr = c['volume'] / vm if vm > 0 else 1.0
     if vr > 2.0:   score += 3; reasons.append(f"Vol {vr:.1f}x")
     elif vr > 1.5: score += 2; reasons.append(f"Vol {vr:.1f}x")
     elif vr > 1.2: score += 1; reasons.append(f"Vol {vr:.1f}x")
 
+    # ── 11. S/R levels ── max 3 ────────────────────────────────────────
+    sr_at   = int(c.get('SR_AT',   0) or 0)
+    sr_near = int(c.get('SR_NEAR', 0) or 0)
+    if sr_at:        score += 3; reasons.append("At S/R level")
+    elif sr_near:    score += 2; reasons.append("Near S/R level")
+    else:
+        # close but not swing-level: within 1%
+        lb_s = max(0, i - 20)
+        recent_highs = list(df['high'].iloc[lb_s:i])
+        recent_lows  = list(df['low'].iloc[lb_s:i])
+        all_sr = recent_highs + recent_lows
+        all_sr = [x for x in all_sr if not pd.isna(x)]
+        if all_sr:
+            close_sr = min(abs(cl - lv) / (cl + 1e-9) for lv in all_sr)
+            if close_sr <= 0.01: score += 1; reasons.append("Close to S/R")
+
+    # ── 12. Candle patterns ── max 3 ───────────────────────────────────
     stoch = float(c.get('STOCHRSI', 0.5) or 0.5)
     if direction == "LONG"  and stoch > 0.92: return 0, ["StochRSI OB"]
     if direction == "SHORT" and stoch < 0.08: return 0, ["StochRSI OS"]
+    if direction == "LONG":
+        if int(c.get('BULL_ENGULF', 0)):     score += 3; reasons.append("Bull engulf ✓")
+        elif int(c.get('HAMMER', 0)):         score += 2; reasons.append("Hammer ✓")
+        elif int(c.get('SOLDIERS', 0)):       score += 2; reasons.append("3 soldiers ✓")
+        elif int(c.get('INSIDE_BAR', 0)):     score += 1; reasons.append("Inside bar")
+    else:
+        if int(c.get('BEAR_ENGULF', 0)):     score += 3; reasons.append("Bear engulf ✓")
+        elif int(c.get('SHOOT_STAR', 0)):     score += 2; reasons.append("Shoot star ✓")
+        elif int(c.get('CROWS', 0)):          score += 2; reasons.append("3 crows ✓")
+        elif int(c.get('INSIDE_BAR', 0)):     score += 1; reasons.append("Inside bar")
+
+    # ── 13. Market structure ── max 1 ──────────────────────────────────
+    if direction == "LONG"  and int(c.get('MS_BULL', 0)): score += 1; reasons.append("Mkt struct HH+HL")
+    if direction == "SHORT" and int(c.get('MS_BEAR', 0)): score += 1; reasons.append("Mkt struct LH+LL")
 
     return max(score, 0), reasons
 
@@ -959,17 +1134,18 @@ def monitor_open_trades():
         if direction == "LONG":
             if not trade.get("tp1_hit") and price >= tp1:
                 trade["tp1_hit"] = True
-                # Move SL to breakeven: cancel old SL, place new SL at entry
                 info = get_exchange_info(sym)
-                if info and trade.get("sl_order_id"):
-                    cancel_orders(sym, [trade.get("sl_order_id")])
-                    time.sleep(0.2)
+                if info:
+                    # ── Move SL to breakeven ──
+                    if trade.get("sl_order_id"):
+                        cancel_orders(sym, [trade.get("sl_order_id")])
+                        time.sleep(0.2)
                     be_price = round_step(entry, info["tickSize"])
                     sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "SELL",
                         "type":          "STOP_MARKET",
-                        "triggerPrice":     be_price,
+                        "triggerPrice":  be_price,
                         "closePosition": "true",
                         "positionSide":  "BOTH",
                         "timeInForce":   "GTC",
@@ -977,7 +1153,28 @@ def monitor_open_trades():
                     if isinstance(sl_resp, dict) and "algoId" in sl_resp:
                         trade["sl_order_id"] = str(sl_resp["algoId"])
                         trade["sl"] = entry
-                tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}` — SL moved to breakeven `${entry:.4f}`")
+                    # ── Cancel old TP1 algo order if still open, then place TP2 ──
+                    if trade.get("tp_order_id"):
+                        cancel_orders(sym, [trade.get("tp_order_id")])
+                        time.sleep(0.2)
+                    tp2_price = round_step(tp2, info["tickSize"])
+                    tp2_resp = fapi_post_algo({
+                        "symbol":        sym,
+                        "side":          "SELL",
+                        "type":          "TAKE_PROFIT_MARKET",
+                        "triggerPrice":  tp2_price,
+                        "closePosition": "true",
+                        "positionSide":  "BOTH",
+                        "timeInForce":   "GTC",
+                    })
+                    if isinstance(tp2_resp, dict) and "algoId" in tp2_resp:
+                        trade["tp2_order_id"] = str(tp2_resp["algoId"])
+                        trade["tp_order_id"]  = ""
+                        add_log(load_state(), f"🎯 {sym} TP1 hit → TP2 order placed @ ${tp2_price:.4f}")
+                    else:
+                        add_log(load_state(), f"⚠ {sym} TP2 order failed: {tp2_resp}")
+                tg(f"🎯 *{sym} LONG TP1 hit* @ `${tp1:.4f}`\n"
+                   f"SL → breakeven `${entry:.4f}` | TP2 order → `${tp2:.4f}`")
             if trade.get("tp1_hit") and price >= tp2:
                 outcome = "TP2_HIT"
                 pnl_pct = ((tp1-entry)/entry*100)*0.5 + ((tp2-entry)/entry*100)*0.5
@@ -987,17 +1184,18 @@ def monitor_open_trades():
         else:
             if not trade.get("tp1_hit") and price <= tp1:
                 trade["tp1_hit"] = True
-                # Move SL to breakeven
                 info = get_exchange_info(sym)
-                if info and trade.get("sl_order_id"):
-                    cancel_orders(sym, [trade.get("sl_order_id")])
-                    time.sleep(0.2)
+                if info:
+                    # ── Move SL to breakeven ──
+                    if trade.get("sl_order_id"):
+                        cancel_orders(sym, [trade.get("sl_order_id")])
+                        time.sleep(0.2)
                     be_price = round_step(entry, info["tickSize"])
                     sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "BUY",
                         "type":          "STOP_MARKET",
-                        "triggerPrice":     be_price,
+                        "triggerPrice":  be_price,
                         "closePosition": "true",
                         "positionSide":  "BOTH",
                         "timeInForce":   "GTC",
@@ -1005,7 +1203,28 @@ def monitor_open_trades():
                     if isinstance(sl_resp, dict) and "algoId" in sl_resp:
                         trade["sl_order_id"] = str(sl_resp["algoId"])
                         trade["sl"] = entry
-                tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}` — SL moved to breakeven `${entry:.4f}`")
+                    # ── Cancel old TP1 algo order if still open, then place TP2 ──
+                    if trade.get("tp_order_id"):
+                        cancel_orders(sym, [trade.get("tp_order_id")])
+                        time.sleep(0.2)
+                    tp2_price = round_step(tp2, info["tickSize"])
+                    tp2_resp = fapi_post_algo({
+                        "symbol":        sym,
+                        "side":          "BUY",
+                        "type":          "TAKE_PROFIT_MARKET",
+                        "triggerPrice":  tp2_price,
+                        "closePosition": "true",
+                        "positionSide":  "BOTH",
+                        "timeInForce":   "GTC",
+                    })
+                    if isinstance(tp2_resp, dict) and "algoId" in tp2_resp:
+                        trade["tp2_order_id"] = str(tp2_resp["algoId"])
+                        trade["tp_order_id"]  = ""
+                        add_log(load_state(), f"🎯 {sym} TP1 hit → TP2 order placed @ ${tp2_price:.4f}")
+                    else:
+                        add_log(load_state(), f"⚠ {sym} TP2 order failed: {tp2_resp}")
+                tg(f"🎯 *{sym} SHORT TP1 hit* @ `${tp1:.4f}`\n"
+                   f"SL → breakeven `${entry:.4f}` | TP2 order → `${tp2:.4f}`")
             if trade.get("tp1_hit") and price <= tp2:
                 outcome = "TP2_HIT"
                 pnl_pct = ((entry-tp1)/entry*100)*0.5 + ((entry-tp2)/entry*100)*0.5
@@ -1108,7 +1327,7 @@ def scan_once():
             scan_results.append(f"{coin}:data_short"); continue
 
         c = df.iloc[i]
-        if any(pd.isna(c.get(k, float('nan'))) for k in ['ATR','EMA200','STOCHRSI','ADX']):
+        if any(pd.isna(c.get(k, float('nan'))) for k in ['ATR','EMA200','STOCHRSI','ADX','VWAP','ICH_KIJUN']):
             scan_results.append(f"{coin}:indicator_nan"); continue
 
         if htf_trend == "BULL":       directions = ["LONG"]
