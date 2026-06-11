@@ -42,13 +42,13 @@ WATCH_LIST = [
     "OPUSDT","ARBUSDT","SUIUSDT","TIAUSDT","FETUSDT"
 ]
 
-MIN_SCORE       = 10
+MIN_SCORE       = 12
 # REMOVED: MAX_SIGNALS_DAY — unlimited signals
 MAX_OPEN_TRADES = 20          # increased to 20
 MIN_RR          = 1.8
 DATA_LIMIT      = 300
 LEVERAGE        = 1
-SCORE_ALLOC_PCT = {4:2.0, 5:3.0, 6:5.0, 7:7.0, 8:9.0, 9:12.0, 10:15.0, 11:15.0}
+SCORE_ALLOC_PCT = {12:2.0, 13:3.0, 14:5.0, 15:7.0, 16:9.0, 17:12.0, 18:15.0, 18:15.0}
 MAX_ALLOC_PCT   = 0.15
 MIN_TRADE_USDT  = 10.0
 
@@ -1345,7 +1345,7 @@ def scan_once(manual=False):
                     continue
 
             # ── New Trade ──
-            alloc_pct = SCORE_ALLOC_PCT.get(min(score, 11), 2.0)
+            alloc_pct = SCORE_ALLOC_PCT.get(min(score, 18), 2.0)
             alloc_usd = round(state["balance"] * (alloc_pct / 100.0), 2)
             alloc_usd = min(alloc_usd, state["balance"] * MAX_ALLOC_PCT)
             alloc_usd = round(alloc_usd, 2)
