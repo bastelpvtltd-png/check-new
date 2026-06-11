@@ -101,11 +101,22 @@ def get_live_balance():
     return None, None
 
 def get_pending_orders():
-    """Returns full list of open orders from Binance."""
+    """Returns full list: basic open orders + algo (SL/TP) orders from Binance."""
     if not API_KEY or not API_SECRET:
         return []
-    data = _bget("/fapi/v1/openOrders", {}, signed=True)
-    return data if isinstance(data, list) else []
+    # Basic orders
+    basic = _bget("/fapi/v1/openOrders", {}, signed=True)
+    basic_list = basic if isinstance(basic, list) else []
+    # Algo orders (conditional SL/TP — where the 26 live)
+    algo_raw = _bget("/fapi/v1/algoOrders/openOrders", {}, signed=True)
+    algo_list = []
+    if isinstance(algo_raw, dict) and "orders" in algo_raw:
+        for o in algo_raw["orders"]:
+            o["_source"] = "algo"
+        algo_list = algo_raw["orders"]
+    elif isinstance(algo_raw, list):
+        algo_list = algo_raw
+    return basic_list + algo_list
 
 def get_binance_positions():
     if not API_KEY or not API_SECRET:
@@ -663,27 +674,37 @@ function renderOpenOrders(orders){
     return;
   }
   tbody.innerHTML=orders.map(o=>{
-    const t=o.type||'';
-    let typeCls='oo-type-other', typeLabel=t;
-    if(t.includes('STOP')){typeCls='oo-type-sl';typeLabel='🛑 '+t;}
-    else if(t.includes('TAKE_PROFIT')){typeCls='oo-type-tp';typeLabel='🎯 '+t;}
+    // Algo orders use 'type' field too; some use 'algoType'
+    const t=(o.type||o.algoType||'').toString().toUpperCase();
+    let typeCls='oo-type-other', typeLabel=t||'ORDER';
+    if(t.includes('STOP')){typeCls='oo-type-sl';typeLabel='🛑 SL'+(t.includes('MARKET')?' MKT':'');}
+    else if(t.includes('TAKE_PROFIT')){typeCls='oo-type-tp';typeLabel='🎯 TP'+(t.includes('MARKET')?' MKT':'');}
+    else if(t.includes('LIMIT')){typeLabel='📋 LIMIT';}
+
     const side=o.side||'—';
     const sideCls=side==='BUY'?'style="color:var(--green)"':'style="color:var(--red)"';
-    const price=o.stopPrice||o.price||o.triggerPrice||'—';
-    const qty=o.origQty||'—';
-    const closeAll=o.closePosition==='true'||o.closePosition===true?'YES':'—';
-    const status=o.status||'—';
-    const oid=o.orderId||o.algoId||'—';
-    const ts=o.updateTime?new Date(o.updateTime).toLocaleTimeString():'—';
+    // Algo orders: triggerPrice; basic orders: stopPrice or price
+    const rawPrice=o.triggerPrice||o.stopPrice||o.price||0;
+    const price=parseFloat(rawPrice||0);
+    const priceStr=price>0?'$'+price.toFixed(4):'—';
+    const qty=o.origQty||o.qty||'—';
+    const closeAll=(o.closePosition==='true'||o.closePosition===true||o.algoType)?
+      '<span style="font-size:9px;color:var(--yellow)">(CloseAll)</span>':'';
+    const status=o.status||o.algoStatus||'ACTIVE';
+    const oid=o.algoId||o.orderId||'—';
+    const isAlgo=!!o.algoId||o._source==='algo';
+    const srcTag=isAlgo?'<span style="font-size:9px;color:var(--accent);margin-left:3px">algo</span>':'';
+    const ts=o.bookTime||o.updateTime||o.time;
+    const tsStr=ts?new Date(parseInt(ts)).toLocaleTimeString():'—';
     return `<tr>
       <td style="font-weight:700">${o.symbol||'—'}</td>
-      <td class="${typeCls}">${typeLabel}</td>
+      <td class="${typeCls}">${typeLabel}${srcTag}</td>
       <td ${sideCls}>${side}</td>
-      <td>$${parseFloat(price||0).toFixed(4)}</td>
-      <td>${qty} ${closeAll!=='—'?'<span style="font-size:9px;color:var(--yellow)">(CloseAll)</span>':''}</td>
-      <td style="color:var(--muted)">${status}</td>
+      <td>${priceStr}</td>
+      <td>${qty} ${closeAll}</td>
+      <td style="color:var(--muted);font-size:10px">${status}</td>
       <td style="font-size:10px;color:var(--muted)">${oid}</td>
-      <td style="font-size:10px;color:var(--muted)">${ts}</td>
+      <td style="font-size:10px;color:var(--muted)">${tsStr}</td>
     </tr>`;
   }).join('');
 }
@@ -787,7 +808,11 @@ async function refresh(){
     renderLog(s);
     renderErrors(s);
     renderStatus(s);
-    if(_activeTab==='orders') renderOpenOrders(s.open_orders||_openOrdersCache);
+    // Always cache open orders from state; render if tab active
+    if(s.open_orders && s.open_orders.length>=0){
+      _openOrdersCache=s.open_orders;
+    }
+    if(_activeTab==='orders') renderOpenOrders(_openOrdersCache);
   }catch(e){console.error('Refresh error:',e)}
 }
 
@@ -850,6 +875,16 @@ def api_state():
     state["live_prices"] = live_prices
     state["open_positions_value"] = round(open_positions_value, 2)
     state["unrealized_pnl"] = round(unrealized_pnl, 2)
+
+    # Ensure keys always present (old state file compat)
+    if "trade_history" not in state:
+        state["trade_history"] = []
+    if "errors" not in state:
+        state["errors"] = []
+    if "signals_today" not in state:
+        state["signals_today"] = len(state.get("closed_trades", []))
+    if "trading_enabled" not in state:
+        state["trading_enabled"] = True
 
     return jsonify(state)
 

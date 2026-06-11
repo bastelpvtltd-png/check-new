@@ -238,14 +238,49 @@ def get_binance_positions():
     return [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
 
 def get_binance_open_orders():
-    data = fapi_get("/fapi/v1/openOrders", {}, signed=True)
-    if isinstance(data, list):
-        return data
-    return []
+    """Fetch both basic open orders AND algo orders (SL/TP)."""
+    basic = fapi_get("/fapi/v1/openOrders", {}, signed=True)
+    basic_list = basic if isinstance(basic, list) else []
+    # Algo orders (conditional SL/TP)
+    algo = fapi_get("/fapi/v1/algoOrders/openOrders", {}, signed=True)
+    algo_list = []
+    if isinstance(algo, dict) and "orders" in algo:
+        for o in algo["orders"]:
+            o["_source"] = "algo"
+        algo_list = algo["orders"]
+    elif isinstance(algo, list):
+        algo_list = algo
+    combined = basic_list + algo_list
+    return combined
 
 def get_all_open_orders_count():
-    data = fapi_get("/fapi/v1/openOrders", {}, signed=True)
-    return len(data) if isinstance(data, list) else 0
+    basic = fapi_get("/fapi/v1/openOrders", {}, signed=True)
+    cnt = len(basic) if isinstance(basic, list) else 0
+    algo = fapi_get("/fapi/v1/algoOrders/openOrders", {}, signed=True)
+    if isinstance(algo, dict) and "orders" in algo:
+        cnt += len(algo["orders"])
+    elif isinstance(algo, list):
+        cnt += len(algo)
+    return cnt
+
+def get_existing_sl_tp_for_symbol(symbol):
+    """Return existing SL/TP algo order IDs for a symbol (to avoid -4130)."""
+    algo = fapi_get("/fapi/v1/algoOrders/openOrders", {}, signed=True)
+    sl_id = ""; tp_id = ""
+    orders = []
+    if isinstance(algo, dict) and "orders" in algo:
+        orders = algo["orders"]
+    elif isinstance(algo, list):
+        orders = algo
+    for o in orders:
+        if o.get("symbol") != symbol:
+            continue
+        otype = o.get("type", "")
+        if "STOP" in otype and not sl_id:
+            sl_id = str(o.get("algoId", o.get("orderId", "")))
+        elif "TAKE_PROFIT" in otype and not tp_id:
+            tp_id = str(o.get("algoId", o.get("orderId", "")))
+    return sl_id, tp_id
 
 def get_klines(symbol, interval="1h", limit=300):
     data = fapi_get("/fapi/v1/klines", {
@@ -356,36 +391,56 @@ def sync_positions_with_binance(state):
                             tp1_price = round_step(tp1_val, info["tickSize"])
                             half_qty  = qty
 
-                            sl_resp = fapi_post_algo({
-                                "symbol":        sym,
-                                "side":          close_side,
-                                "type":          "STOP_MARKET",
-                                "triggerPrice":  sl_price,
-                                "closePosition": "true",
-                                "positionSide":  "BOTH",
-                                "timeInForce":   "GTC",
-                            })
-                            if isinstance(sl_resp, dict) and "algoId" in sl_resp:
-                                sl_order_id = str(sl_resp["algoId"])
-                                add_log(state, f"✅ SYNC SL placed {sym} @ {sl_price}")
+                            # Check if SL/TP already exist on exchange (-4130 guard)
+                            exist_sl_id, exist_tp_id = get_existing_sl_tp_for_symbol(sym)
+
+                            if exist_sl_id:
+                                sl_order_id = exist_sl_id
+                                add_log(state, f"ℹ️ SYNC {sym}: SL already exists (id={exist_sl_id}), reusing")
                             else:
-                                add_error(state, f"SYNC SL failed {sym}: {sl_resp}")
+                                sl_resp = fapi_post_algo({
+                                    "symbol":        sym,
+                                    "side":          close_side,
+                                    "type":          "STOP_MARKET",
+                                    "triggerPrice":  sl_price,
+                                    "closePosition": "true",
+                                    "positionSide":  "BOTH",
+                                    "timeInForce":   "GTC",
+                                })
+                                if isinstance(sl_resp, dict) and "algoId" in sl_resp:
+                                    sl_order_id = str(sl_resp["algoId"])
+                                    add_log(state, f"✅ SYNC SL placed {sym} @ {sl_price}")
+                                elif isinstance(sl_resp, dict) and sl_resp.get("code") == -4130:
+                                    # Already exists — fetch and reuse
+                                    exist_sl_id2, _ = get_existing_sl_tp_for_symbol(sym)
+                                    sl_order_id = exist_sl_id2
+                                    add_log(state, f"ℹ️ SYNC {sym}: SL conflict -4130, reusing existing id={exist_sl_id2}")
+                                else:
+                                    add_error(state, f"SYNC SL failed {sym}: {sl_resp}")
                             time.sleep(0.3)
 
-                            tp1_resp = fapi_post_algo({
-                                "symbol":        sym,
-                                "side":          close_side,
-                                "type":          "TAKE_PROFIT_MARKET",
-                                "triggerPrice":  tp1_price,
-                                "closePosition": "true",
-                                "positionSide":  "BOTH",
-                                "timeInForce":   "GTC",
-                            })
-                            if isinstance(tp1_resp, dict) and "algoId" in tp1_resp:
-                                tp1_order_id = str(tp1_resp["algoId"])
-                                add_log(state, f"✅ SYNC TP1 placed {sym} @ {tp1_price}")
+                            if exist_tp_id:
+                                tp1_order_id = exist_tp_id
+                                add_log(state, f"ℹ️ SYNC {sym}: TP already exists (id={exist_tp_id}), reusing")
                             else:
-                                add_error(state, f"SYNC TP1 failed {sym}: {tp1_resp}")
+                                tp1_resp = fapi_post_algo({
+                                    "symbol":        sym,
+                                    "side":          close_side,
+                                    "type":          "TAKE_PROFIT_MARKET",
+                                    "triggerPrice":  tp1_price,
+                                    "closePosition": "true",
+                                    "positionSide":  "BOTH",
+                                    "timeInForce":   "GTC",
+                                })
+                                if isinstance(tp1_resp, dict) and "algoId" in tp1_resp:
+                                    tp1_order_id = str(tp1_resp["algoId"])
+                                    add_log(state, f"✅ SYNC TP1 placed {sym} @ {tp1_price}")
+                                elif isinstance(tp1_resp, dict) and tp1_resp.get("code") == -4130:
+                                    _, exist_tp_id2 = get_existing_sl_tp_for_symbol(sym)
+                                    tp1_order_id = exist_tp_id2
+                                    add_log(state, f"ℹ️ SYNC {sym}: TP conflict -4130, reusing existing id={exist_tp_id2}")
+                                else:
+                                    add_error(state, f"SYNC TP1 failed {sym}: {tp1_resp}")
                 except Exception as e:
                     add_error(state, f"SYNC SL/TP calc error {sym}: {e}")
 
@@ -1125,7 +1180,11 @@ def monitor_open_trades():
 # ═══════════════════════════════════════════════
 # MAIN SCAN
 # ═══════════════════════════════════════════════
+_binance_positions_cache = []
+
 def scan_once(manual=False):
+    global _binance_positions_cache
+
     with _lock:
         state = load_state()
 
@@ -1146,6 +1205,7 @@ def scan_once(manual=False):
         add_error(state, "Could not fetch wallet balance")
 
     state["pending_orders_count"] = get_all_open_orders_count()
+    _binance_positions_cache = get_binance_positions()  # cache for signal filtering
     prefix = "🔧 MANUAL " if manual else "🔍 "
     add_log(state, f"{prefix}Scanning {len(WATCH_LIST)} coins | Balance: ${state['balance']:.2f}")
     state["bot_status"] = "scanning"
@@ -1197,10 +1257,25 @@ def scan_once(manual=False):
                 state = load_state()
 
             # ── Duplicate/Conflict Signal Check ──
+            # Check BOTH state open_trades AND live Binance positions for the coin
+            # This prevents placing a duplicate when state is out of sync
+            binance_pos_for_coin = [
+                p for p in _binance_positions_cache
+                if p.get("symbol") == coin and abs(float(p.get("positionAmt", 0))) > 0
+            ]
+            binance_directions = set()
+            for bp in binance_pos_for_coin:
+                binance_directions.add("LONG" if float(bp["positionAmt"]) > 0 else "SHORT")
+
             existing_same_dir = [t for t in state["open_trades"]
                                   if t["symbol"] == coin and t["direction"] == direction]
             existing_opp_dir  = [t for t in state["open_trades"]
                                   if t["symbol"] == coin and t["direction"] != direction]
+
+            # If Binance has position for this coin in same direction but state doesn't → skip (synced next cycle)
+            if not existing_same_dir and direction in binance_directions:
+                scan_results.append(f"{coin}:{direction}_binance_pos_exists_skip")
+                continue
 
             # SAME direction: update if score >= old + 2, else reject
             if existing_same_dir:
