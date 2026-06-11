@@ -682,25 +682,37 @@ def score_signal(df, i, direction, htf_trend, htf_strength):
 
     return max(score, 0), reasons
 
+MAX_SL_PCT = 1.2   # Hard cap: SL never wider than 1.2% from entry
+TP1_RISK_MULT = 1.5  # TP1 = Entry ± Risk × 1.5
+TP2_RISK_MULT = 3.0  # TP2 = Entry ± Risk × 3.0
+
 def calculate_levels(df, i, direction, entry):
     c   = df.iloc[i]
     atr = float(c['ATR']) if not pd.isna(c['ATR']) else entry * 0.015
     lb  = max(0, i - 20)
     rl  = df['low'].iloc[lb:i]; rh = df['high'].iloc[lb:i]
+
     if direction == "LONG":
+        # Prefer ATR-based or swing low — but HARD cap at MAX_SL_PCT
         atr_sl = entry - atr * 1.8
         sw_sl  = float(rl.min()) * 0.998 if len(rl) > 0 else atr_sl
         sl  = min(atr_sl, sw_sl)
-        sl  = min(sl, entry * 0.985); sl = max(sl, entry * 0.970)
+        # Hard cap: SL must be within MAX_SL_PCT below entry
+        sl  = max(sl, entry * (1.0 - MAX_SL_PCT / 100.0))
         risk = entry - sl
-        tp1 = entry + risk * 2.0; tp2 = entry + risk * 3.5
+        tp1 = entry + risk * TP1_RISK_MULT
+        tp2 = entry + risk * TP2_RISK_MULT
     else:
+        # SHORT — prefer ATR-based or swing high — HARD cap at MAX_SL_PCT above entry
         atr_sl = entry + atr * 1.8
         sw_sl  = float(rh.max()) * 1.002 if len(rh) > 0 else atr_sl
         sl  = max(atr_sl, sw_sl)
-        sl  = max(sl, entry * 1.015); sl = min(sl, entry * 1.030)
+        # Hard cap: SL must be within MAX_SL_PCT above entry
+        sl  = min(sl, entry * (1.0 + MAX_SL_PCT / 100.0))
         risk = sl - entry
-        tp1 = entry - risk * 2.0; tp2 = entry - risk * 3.5
+        tp1 = entry - risk * TP1_RISK_MULT
+        tp2 = entry - risk * TP2_RISK_MULT
+
     sl_pct  = abs(entry - sl) / entry * 100
     tp1_pct = abs(tp1 - entry) / entry * 100
     rr = tp1_pct / sl_pct if sl_pct > 0 else 0
@@ -761,13 +773,18 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
     sl_price  = round_step(sl,  info["tickSize"])
     tp1_price = round_step(tp1, info["tickSize"])
 
-    # ── 2. Stop-Loss (REQUIRED) ──
+    # Half qty for TP1 partial close (50%)
+    half_qty = round_step(qty / 2.0, info["stepSize"])
+    if half_qty <= 0:
+        half_qty = qty  # fallback: if step size rounds to 0, use full qty
+
+    # ── 2. Stop-Loss (REQUIRED) — closes full remaining position ──
     sl_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
         "type":          "STOP_MARKET",
         "triggerPrice":  sl_price,
-        "closePosition": "true",
+        "closePosition": "true",        # full close (correct for SL)
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
     })
@@ -780,7 +797,6 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
         add_error(state, f"{symbol} SL placement FAILED: {sl_resp} — closing entry for safety")
         save_state(state)
         tg_error(f"{symbol} SL FAILED after entry. Closing position for safety.")
-        # Emergency close
         fapi_post("/fapi/v1/order", {
             "symbol":       symbol,
             "side":         close_side,
@@ -792,20 +808,23 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
 
     time.sleep(0.3)
 
-    # ── 3. TP1 (REQUIRED) ──
+    # ── 3. TP1 (REQUIRED) — closes 50% only to lock profit ──
+    # NOTE: uses explicit half_qty (NOT closePosition=true) so only 50% is closed.
+    # The remaining 50% is then tracked in software toward TP2 or breakeven.
     tp1_resp = fapi_post_algo({
         "symbol":        symbol,
         "side":          close_side,
         "type":          "TAKE_PROFIT_MARKET",
         "triggerPrice":  tp1_price,
-        "closePosition": "true",
+        "quantity":      half_qty,      # 50% partial close
         "positionSide":  "BOTH",
         "timeInForce":   "GTC",
+        "reduceOnly":    "true",
     })
     tp1_order_id = ""
     if isinstance(tp1_resp, dict) and "algoId" in tp1_resp:
         tp1_order_id = str(tp1_resp["algoId"])
-        log.info(f"TP1 placed: {symbol} @ {tp1_price} id={tp1_order_id}")
+        log.info(f"TP1 (50%) placed: {symbol} @ {tp1_price} qty={half_qty} id={tp1_order_id}")
     else:
         # TP1 failed — cancel SL and close the entry for safety
         add_error(state, f"{symbol} TP1 placement FAILED: {tp1_resp} — cancelling SL and closing for safety")
@@ -828,7 +847,7 @@ def place_futures_order(symbol, side, usdt_amount, entry_price, sl, tp1, tp2=Non
         "tp_order_id":  tp1_order_id,
         "tp2_order_id": "",          # TP2 = software monitor only
         "qty":          qty,
-        "half_qty":     qty,
+        "half_qty":     half_qty,    # 50% qty stored for reference
         "notional":     round(notional, 2),
     }, "ok"
 
@@ -1028,29 +1047,56 @@ def monitor_open_trades():
         outcome = None; pnl_pct = 0.0; close_reason = ""
 
         if direction == "LONG":
-            # ── Pro Trailing: TP1 hit → move SL to Breakeven, target TP2 ──
+            # ── TP1 hit → close 50%, move SL to Breakeven, track remaining 50% toward TP2 ──
             if not trade.get("tp1_hit") and price >= tp1:
                 trade["tp1_hit"] = True
                 info = get_exchange_info(sym)
-                if info and trade.get("sl_order_id"):
-                    cancel_orders(sym, [trade.get("sl_order_id")])
+                if info:
+                    half_qty = trade.get("half_qty", 0)
+                    if half_qty <= 0:
+                        half_qty = round_step(trade.get("qty", 0) / 2.0, info["stepSize"])
+
+                    # Step 1: Cancel old exchange SL order (will replace with BE SL)
+                    # and cancel TP1 algo order (already triggered, but clean up)
+                    cancel_orders(sym, [trade.get("sl_order_id"), trade.get("tp_order_id")])
                     time.sleep(0.2)
+
+                    # Step 2: Market-close 50% to lock profit now
+                    close_resp = fapi_post("/fapi/v1/order", {
+                        "symbol":       sym,
+                        "side":         "SELL",
+                        "type":         "MARKET",
+                        "quantity":     half_qty,
+                        "positionSide": "BOTH",
+                        "reduceOnly":   "true",
+                    })
+                    if isinstance(close_resp, dict) and "orderId" in close_resp:
+                        add_log(state, f"💰 {sym} TP1 hit @ ${tp1:.4f} — closed 50% ({half_qty}) @ market")
+                    else:
+                        add_error(state, f"{sym} TP1 50% close failed: {close_resp}")
+
+                    time.sleep(0.3)
+
+                    # Step 3: Place new SL at Breakeven for the remaining 50%
                     be_price = round_step(entry, info["tickSize"])
                     sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "SELL",
                         "type":          "STOP_MARKET",
                         "triggerPrice":  be_price,
-                        "closePosition": "true",
+                        "closePosition": "true",   # closes the remaining 50%
                         "positionSide":  "BOTH",
                         "timeInForce":   "GTC",
                     })
                     if isinstance(sl_resp, dict) and "algoId" in sl_resp:
                         trade["sl_order_id"] = str(sl_resp["algoId"])
                         trade["sl"] = entry
-                        sl = entry  # update local var too
-                        add_log(state, f"🎯 {sym} TP1 hit @ ${tp1:.4f} — SL moved to breakeven ${entry:.4f}, targeting TP2 ${tp2:.4f}")
-                # Update state immediately
+                        sl = entry
+                        add_log(state, f"🎯 {sym} SL moved to Breakeven ${entry:.4f} | Targeting TP2 ${tp2:.4f}")
+                    else:
+                        add_error(state, f"{sym} Breakeven SL placement failed: {sl_resp}")
+
+                # Persist state immediately
                 with _lock:
                     state2 = load_state()
                     for t in state2["open_trades"]:
@@ -1059,9 +1105,12 @@ def monitor_open_trades():
                             t["sl"] = entry
                             if isinstance(sl_resp, dict) and "algoId" in sl_resp:
                                 t["sl_order_id"] = str(sl_resp["algoId"])
+                            t["tp_order_id"] = ""    # TP1 order is done
                             break
                     save_state(state2)
-                tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}`\nSL moved to Breakeven `${entry:.4f}` | Next target TP2 `${tp2:.4f}`")
+                tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}`\n"
+                   f"✅ 50% position closed (profit locked)\n"
+                   f"SL moved to Breakeven `${entry:.4f}` | Next target TP2 `${tp2:.4f}`")
 
             # After TP1 hit, monitor for TP2 or BE stop
             if trade.get("tp1_hit") and price >= tp2:
@@ -1078,20 +1127,43 @@ def monitor_open_trades():
                     close_reason = "SL Hit"
                     pnl_pct = (trade["sl"] - entry) / entry * 100  # negative
         else:
-            # SHORT — Pro Trailing
+            # ── SHORT TP1 hit → close 50%, move SL to Breakeven, track remaining 50% toward TP2 ──
             if not trade.get("tp1_hit") and price <= tp1:
                 trade["tp1_hit"] = True
                 info = get_exchange_info(sym)
-                if info and trade.get("sl_order_id"):
-                    cancel_orders(sym, [trade.get("sl_order_id")])
+                if info:
+                    half_qty = trade.get("half_qty", 0)
+                    if half_qty <= 0:
+                        half_qty = round_step(trade.get("qty", 0) / 2.0, info["stepSize"])
+
+                    # Step 1: Cancel old SL and TP1 algo orders
+                    cancel_orders(sym, [trade.get("sl_order_id"), trade.get("tp_order_id")])
                     time.sleep(0.2)
+
+                    # Step 2: Market-close 50% to lock profit now
+                    close_resp = fapi_post("/fapi/v1/order", {
+                        "symbol":       sym,
+                        "side":         "BUY",
+                        "type":         "MARKET",
+                        "quantity":     half_qty,
+                        "positionSide": "BOTH",
+                        "reduceOnly":   "true",
+                    })
+                    if isinstance(close_resp, dict) and "orderId" in close_resp:
+                        add_log(state, f"💰 {sym} TP1 hit @ ${tp1:.4f} — closed 50% ({half_qty}) @ market")
+                    else:
+                        add_error(state, f"{sym} TP1 50% close failed: {close_resp}")
+
+                    time.sleep(0.3)
+
+                    # Step 3: Place new SL at Breakeven for remaining 50%
                     be_price = round_step(entry, info["tickSize"])
                     sl_resp = fapi_post_algo({
                         "symbol":        sym,
                         "side":          "BUY",
                         "type":          "STOP_MARKET",
                         "triggerPrice":  be_price,
-                        "closePosition": "true",
+                        "closePosition": "true",   # closes the remaining 50%
                         "positionSide":  "BOTH",
                         "timeInForce":   "GTC",
                     })
@@ -1099,7 +1171,10 @@ def monitor_open_trades():
                         trade["sl_order_id"] = str(sl_resp["algoId"])
                         trade["sl"] = entry
                         sl = entry
-                        add_log(state, f"🎯 {sym} TP1 hit @ ${tp1:.4f} — SL moved to breakeven ${entry:.4f}, targeting TP2 ${tp2:.4f}")
+                        add_log(state, f"🎯 {sym} SL moved to Breakeven ${entry:.4f} | Targeting TP2 ${tp2:.4f}")
+                    else:
+                        add_error(state, f"{sym} Breakeven SL placement failed: {sl_resp}")
+
                 with _lock:
                     state2 = load_state()
                     for t in state2["open_trades"]:
@@ -1108,9 +1183,12 @@ def monitor_open_trades():
                             t["sl"] = entry
                             if isinstance(sl_resp, dict) and "algoId" in sl_resp:
                                 t["sl_order_id"] = str(sl_resp["algoId"])
+                            t["tp_order_id"] = ""
                             break
                     save_state(state2)
-                tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}`\nSL moved to Breakeven `${entry:.4f}` | Next target TP2 `${tp2:.4f}`")
+                tg(f"🎯 *{sym} TP1 hit* @ `${tp1:.4f}`\n"
+                   f"✅ 50% position closed (profit locked)\n"
+                   f"SL moved to Breakeven `${entry:.4f}` | Next target TP2 `${tp2:.4f}`")
 
             if trade.get("tp1_hit") and price <= tp2:
                 outcome = "TP2_HIT"
@@ -1129,9 +1207,29 @@ def monitor_open_trades():
         if outcome:
             alloc    = trade["alloc_usd"]
             notional = trade.get("notional", alloc * LEVERAGE)
-            pnl_usd  = notional * abs(pnl_pct) / 100
+
             if outcome == "SL_HIT":
-                pnl_usd = -pnl_usd
+                # Full loss — 100% of notional at SL distance (tp1 was never hit)
+                pnl_usd = -(notional * abs(pnl_pct) / 100)
+            elif outcome == "BREAKEVEN":
+                # 50% was closed at TP1 for a gain; remaining 50% closed at entry (BE)
+                tp1_pct_gain = abs(tp1 - entry) / entry * 100
+                pnl_half_tp1 = (notional * 0.5) * tp1_pct_gain / 100   # profit on first 50%
+                pnl_half_be  = 0.0                                       # $0 on remaining 50%
+                pnl_usd = round(pnl_half_tp1 + pnl_half_be, 2)
+                pnl_pct = pnl_usd / notional * 100 if notional > 0 else 0
+            elif outcome == "TP2_HIT":
+                # 50% closed at TP1, 50% closed at TP2
+                tp1_pct_gain = abs(tp1 - entry) / entry * 100
+                tp2_pct_gain = abs(tp2 - entry) / entry * 100
+                pnl_half_tp1 = (notional * 0.5) * tp1_pct_gain / 100
+                pnl_half_tp2 = (notional * 0.5) * tp2_pct_gain / 100
+                pnl_usd = round(pnl_half_tp1 + pnl_half_tp2, 2)
+                pnl_pct = pnl_usd / notional * 100 if notional > 0 else 0
+            else:
+                pnl_usd = notional * abs(pnl_pct) / 100
+                if outcome == "SL_HIT":
+                    pnl_usd = -pnl_usd
 
             cancel_orders(sym, [trade.get("sl_order_id"), trade.get("tp_order_id"), trade.get("tp2_order_id")])
 
